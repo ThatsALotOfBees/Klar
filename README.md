@@ -821,6 +821,45 @@ Override the default subdomain with `tunnel -Subdomain my-name`, or force a rand
 - **Auto-start `tunnel` on login** via Windows Task Scheduler. One-line setup; turns the host's "run a command" step into "boot your machine."
 - **Apply manifest's `serverUrl` to `userData/client-config.json`** during update. Currently the client reads `serverUrl` from the bundle + userData layer; the manifest's `serverUrl` is metadata only. If the user ever changes the stable subdomain, distributed EXEs would need a manual rebuild to pick it up. Safe to defer because the URL change is rare.
 
+### 2026-05-07 — Server event logging + `up` auto-starts the tunnel
+**Goal:** User wanted (a) every server event logged between server start and end, and (b) `up` to also bring up the tunnel automatically. After this, "be online for testing" really is one command.
+
+**Changes:**
+
+`server.js` — structured logging:
+- New `log` helper. Format: `[2026-05-07T12:34:56.789Z] INFO  server.listen          ready url=http://localhost:3000`. Width-aligned columns, key=value extras, JSON-encoded values for non-strings. Greppable: `grep ws.` filters every WebSocket event, `grep auth.` every login/registration, etc.
+- Event lines at: `server.boot` (port + pid + node version + dataDir), `accounts.kdb` (KDB restore/export counts), `server.listen` (ready), `auth.register` / `auth.login` / `auth.logout`, `ws.open` / `ws.auth` / `ws.close` (with usernames and remaining-socket count), `dm.create` / `dm.e2ee` / `msg.dm`, `server.create` / `server.delete` / `server.leave`, `channel.create` / `msg.channel`, `invite.create` / `invite.accept`, `http.error`, `process.uncaught` / `process.unhandled`, `server.shutdown` (close http, close db).
+- SIGINT / SIGTERM handlers: log signal received, close http server + close db, force-exit after 3s if anything hangs. Windows quirk: `Stop-Process` is hard-kill, so the shutdown lines are best-effort there.
+
+`shell.ps1` — auto-tunnel and unified status/logs:
+- `Start-KlarBackground` (`up`) now spawns the localtunnel alongside the server whenever `tunnelSubdomain` is set in `client-config.json`. New `-NoTunnel` switch turns this off for offline development. Tunnel pid lives in `.klar.tunnel.pid`; stdout in `klar.tunnel.log`; stderr in `klar.tunnel.err.log`.
+- `Stop-KlarBackground` (`down`) kills both processes, in tunnel-then-server order so connected clients see a graceful disconnect from the tunnel before the server itself goes away.
+- `status` shows server pid, tunnel pid, the public `https://*.loca.lt` URL extracted from the tunnel log, plus the existing port / db size / log size lines.
+- `logs` now prints both `klar.log` and `klar.tunnel.log` (and stderr files if non-empty) with section headers, in one call.
+- New helpers `Get-KlarTunnelPid` / `Get-KlarTunnelSubdomain` / `Get-KlarTunnelUrl` — small functions, cleanly composable.
+
+**Decisions:**
+- **Plain-text log, not JSON Lines.** Easier to scan in `tail` / `logs`, easier to grep, easier to read at 3am when something breaks. JSONL would be friendlier to log shipping (Datadog, ELK) but that's not Klar's audience right now.
+- **Tunnel is opt-out via `-NoTunnel`, not opt-in.** Now that the project has a pinned subdomain in `client-config.json`, the *intent* of every `up` is "be reachable for testing." Opt-out matches that.
+- **Separate stdout / stderr log files for the tunnel.** Windows `Start-Process` rejects redirecting both to the same path with `RedirectStandardOutput == RedirectStandardError`. Tried merging earlier and got `This command cannot be run because "RedirectStandardOutput" and "RedirectStandardError" are same`. Two files, two paths, simple.
+- **Tunnel order on shutdown** is tunnel first, server second. Connected clients see the tunnel close (which they reconnect-loop on), rather than the server close (which would leave them holding ghost connections to a tunnel that still resolves).
+
+**Verification:**
+- `node --check` clean on server.js.
+- Lifecycle: `up` → server pid + tunnel pid both up, status reports both running, public URL `https://klar-thatsalotofbees.loca.lt` extracted from tunnel log. Hit `/api/register` to create a user → log file got the `auth.register new account user=logtest id=...` line. `down` killed both, status flipped to stopped.
+- klar.log ends up looking like:
+  ```
+  [2026-05-07T...] INFO  server.boot    starting port=3098 pid=21336 node=v24.14.0 dataDir=...
+  [2026-05-07T...] INFO  accounts.kdb   KDB sync done restored=0 exported=0 dir=DATA\ACCOUNTS
+  [2026-05-07T...] INFO  server.listen  ready url=http://localhost:3098
+  [2026-05-07T...] INFO  auth.register  new account user=logtest id=82b5d07c10fff26ed1d3c422
+  ```
+- klar.tunnel.log holds the localtunnel CLI output (`your url is: https://klar-thatsalotofbees.loca.lt`).
+
+**Open / next:**
+- **Auto-start `up` on Windows login** via Task Scheduler — turns the current "open dev shell, run `up`" into "boot your machine and you're online." 1-minute setup; documented in earlier roadmap.
+- **Truly always-on hosting** (fly.io / render.com / VPS) is the only way to remove the host-side step entirely. Standing offer.
+
 ## Roadmap (post-MVP)
 
 - Forward secrecy via Double Ratchet or MLS.
