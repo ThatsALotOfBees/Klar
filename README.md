@@ -860,6 +860,38 @@ Override the default subdomain with `tunnel -Subdomain my-name`, or force a rand
 - **Auto-start `up` on Windows login** via Task Scheduler — turns the current "open dev shell, run `up`" into "boot your machine and you're online." 1-minute setup; documented in earlier roadmap.
 - **Truly always-on hosting** (fly.io / render.com / VPS) is the only way to remove the host-side step entirely. Standing offer.
 
+### 2026-05-07 — Server-URL discovery: clients auto-pick up the host's tunnel URL
+**Goal:** User: "i basically want all clients to automatically know what tunnel and clients don't have to configure manually." Even with a stable subdomain, the URL could in theory drift (claim conflict, changed setup, host preference), and we want clients to follow without a rebuild + redistribute step.
+
+**Solution: a one-line discovery JSON on GitHub.**
+- `client-releases/server.json` lives at the host's GitHub repo root and holds the current `serverUrl` plus a timestamp.
+- The dev shell's `up` command, after the tunnel is online, compares the obtained URL with `server.json`. If different, it rewrites the file and **auto-commits + pushes**. Same URL = no commit (no spam).
+- Clients fetch `https://raw.githubusercontent.com/<repo>/<branch>/client-releases/server.json` at boot (with a query-string cachebuster + `Cache-Control: no-cache`), and if it has a `serverUrl`, stash it in a runtime override that takes precedence over the bundled `KLAR_CONFIG.serverUrl`.
+
+**Changes:**
+- `client-releases/server.json` (new) — initial value pinned to `https://klar-thatsalotofbees.loca.lt`.
+- `public/api.js` — new `_runtimeServerUrl` runtime override that beats `window.KLAR_CONFIG.serverUrl` in `serverBase()`. New `api.discoverServerUrl()` fetches the discovery file with a 4s timeout and writes the override on success. Silent on any failure (no network, no `updateRepo` set, malformed JSON, etc.) — falls back to bundled URL gracefully.
+- `public/app.js` — `boot()` awaits `api.discoverServerUrl()` before the connectivity probe, so the URL is current by the time the probe fires. The "Retry" button on the unreachable-server screen calls `boot()` again, which means a re-discovery — friends who saw the broken-cable screen while the host's tunnel was down click Retry the moment the host runs `up`, and the new URL flows through.
+- `shell.ps1` — new `Publish-KlarServerUrl` helper called from `Start-KlarBackground` after the tunnel URL is detected. Reads `client-releases/server.json`, no-ops if URL hasn't changed, otherwise writes the new value + `git add` + `git commit` + `git push`. Failures are non-fatal (`up` still returns successfully even if the push fails — the local server + tunnel remain useful).
+- Version bumped 0.1.4 → 0.1.5; snapshot in `client-releases/0.1.5/`. Installed 0.1.x clients pick up the new discovery code on their next manifest poll without any manual reinstall.
+
+**Decisions:**
+- **Auto-commit only on URL change.** Naive "commit every session" would create dozens of no-op commits per week. The `if ($current.serverUrl -eq $Url) { return }` short-circuit keeps the history meaningful.
+- **Cachebuster query string + `Cache-Control: no-cache`** on the discovery fetch. GitHub Raw caches up to 5 minutes for hot files; the cachebuster bypasses it. Without this, friends would be on stale URLs for several minutes after a change.
+- **Discovery on every boot, not on a timer.** Keeps the flow simple. If a friend's session is running while the host's URL changes, they need to retry/relaunch — but the broken-cable screen already gives them a Retry button that reboots cleanly. No background re-poll needed at this scale.
+- **Discovery file is a sibling of `manifest.json`, not part of it.** Bumping the manifest version forces a client redownload of all files; a URL change shouldn't. Two files = two cadences.
+- **Discovery is best-effort** — it won't break a working setup if it fails. The `try { fetch } catch {}` keeps the bundled URL as a stable fallback for any client whose `updateRepo` is unset or unreachable.
+
+**Verification:**
+- `node --check` clean on api.js, app.js, server.js.
+- Lifecycle: `up` started server + tunnel, detected `https://klar-thatsalotofbees.loca.lt`, ran the publish flow, saw the URL was already current, skipped the commit ("serverUrl already current on GitHub - no commit needed"). ✓
+- `client-releases/server.json` correctly written and committed to `main`. `git ls-tree --name-only origin/main client-releases/` lists it.
+- Once GitHub Raw's CDN catches up (~30s post-push), `curl https://raw.githubusercontent.com/ThatsALotOfBees/Klar/main/client-releases/server.json` returns the file body — that's what installed clients will see.
+
+**Open / next:**
+- **Background re-poll for long-running sessions.** Tiny addition: a `setInterval(() => api.discoverServerUrl(), 5 * 60 * 1000)` in app.js boot. Useful if someone keeps the app open all day across several tunnel cycles.
+- **Tunnel-up notification on shutdown.** Currently when the host runs `down`, friends get connection errors mid-action. A "going offline in 10s" courtesy WebSocket broadcast would be friendlier.
+
 ## Roadmap (post-MVP)
 
 - Forward secrecy via Double Ratchet or MLS.

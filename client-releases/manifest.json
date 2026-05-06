@@ -1,15 +1,15 @@
 {
-  "version": "0.1.5",
-  "releasedAt": "2026-05-06T23:19:41.969Z",
+  "version": "0.1.6",
+  "releasedAt": "2026-05-06T23:54:14.698Z",
   "serverUrl": "https://klar-thatsalotofbees.loca.lt",
   "files": [
     {
       "path": "api.js",
-      "sha256": "8901a5aeac9af20f476a1d84015e51f35f440e09611644be5cf4d79abf63fe43"
+      "sha256": "8ecbe43e3b7d047af71643fa134aa897a142abf0ed2f057747f7d5eb77c13e57"
     },
     {
       "path": "app.js",
-      "sha256": "430df51aae3c6e78311b7c49b118c804e4d33dd4d4a9054d8cd1c0165511f1e5"
+      "sha256": "50451bda1c9ac8fbe049204b349c467c8f19f48b428ec91a458333655e565bf0"
     },
     {
       "path": "crypto.js",
