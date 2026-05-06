@@ -173,6 +173,7 @@ function Start-KlarBackground {
         $url = Get-KlarTunnelUrl
         if ($url) {
             Write-Host "Klar tunnel up:  $url" -ForegroundColor Cyan
+            Publish-KlarServerUrl -Url $url
         } else {
             Write-Host "Klar tunnel started (pid $($tunnelProc.Id)) but no URL yet - check 'logs'." -ForegroundColor Yellow
         }
@@ -183,6 +184,52 @@ function Start-KlarBackground {
     Write-Host "Logs: $Global:KlarLogFile  (use 'logs' or 'tail')" -ForegroundColor DarkGray
 }
 Set-Alias up Start-KlarBackground -Scope Global
+
+function Publish-KlarServerUrl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$Url)
+
+    # Auto-publishes the live tunnel URL to client-releases/server.json on
+    # GitHub so installed clients can discover it. Only commits + pushes if
+    # the URL has actually changed, to avoid spam commits per session.
+    $serverJson = Join-Path $KlarRoot 'client-releases\server.json'
+    if (-not (Test-Path $serverJson)) {
+        Write-Host "  (skip publish: client-releases\server.json missing)" -ForegroundColor DarkGray
+        return
+    }
+    try {
+        $current = Get-Content $serverJson -Raw | ConvertFrom-Json
+    } catch {
+        Write-Host "  (skip publish: server.json unreadable)" -ForegroundColor DarkGray
+        return
+    }
+    if ($current.serverUrl -eq $Url) {
+        Write-Host "  serverUrl already current on GitHub ($Url) - no commit needed." -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host "  Publishing new serverUrl to GitHub..." -ForegroundColor Cyan
+    $current.serverUrl = $Url
+    $current.updatedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $current | ConvertTo-Json -Depth 10 | Set-Content -Path $serverJson -Encoding utf8
+
+    # Quietly commit + push. Don't fail `up` on a git error - the local
+    # server + tunnel are still useful even if publish fails.
+    Push-Location $KlarRoot
+    try {
+        & git add 'client-releases/server.json' 2>&1 | Out-Null
+        $msg = "auto: tunnel URL -> $Url"
+        & git commit -m $msg 2>&1 | Out-Null
+        & git push 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Pushed: $Url (clients will discover within ~1 min)" -ForegroundColor Green
+        } else {
+            Write-Host "  git push failed (exit $LASTEXITCODE) - URL written locally but not pushed." -ForegroundColor Yellow
+        }
+    } finally {
+        Pop-Location
+    }
+}
 
 function Stop-KlarBackground {
     $serverPid = Get-KlarPid
