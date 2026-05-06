@@ -672,6 +672,48 @@ The renderer was doing exactly what it was told: every message had the same `sen
 - **Differential / chunked updates**. Currently every poll that finds a new version downloads every file. A bigger client could benefit from a "files changed since X" delta. Not worth it at this scale.
 - **Network resilience.** The updater retries the next poll on failure, but doesn't currently back off or surface failures to the user. Fine for an MVP.
 
+### 2026-05-06 — Fix empty-window bug + "couldn't connect to the server" UI + initial git push to GitHub
+**Goal:** User reported the packaged EXE opens with a black, empty window — only the unstyled traffic-light buttons visible, nothing else. Asked for a friendly "couldn't connect to the server, please try again later" screen with a broken-cable icon to be shown in that case. Also gave me their GitHub repo URL (`https://github.com/ThatsALotOfBees/Klar.git`) so I could push everything.
+
+**The empty-window root cause:** `public/index.html` referenced `/styles.css` and `/app.js` with **absolute** paths. Under `http://localhost:3000` (dev mode) those resolve correctly against the origin. Under `file:///.../client/index.html` (packaged mode) they resolve against the filesystem root and 404. Neither stylesheet nor script loads → no CSS, no app.js, nothing gets mounted into `#app`. The user just sees the bare HTML markup of the title bar (which is why the traffic lights are unstyled white squares with their default browser button look).
+
+**Fix #1 — relative paths in `public/index.html`:** changed `href="/styles.css"` → `href="styles.css"` and `src="/app.js"` → `src="app.js"`. Now identical behavior under both origins.
+
+**Fix #2 — server connectivity probe + error screen:**
+- New `api.probe()` in `public/api.js` — does a `GET apiUrl('/api/me')` with `AbortSignal.timeout(3500)`. Any HTTP response (even 401) = reachable; only fetch failures / timeouts mean the server is down.
+- New `renderServerUnreachable()` in `public/app.js` — clears `#app` and mounts a centered error card with the broken-cable SVG, "Couldn't connect to the server" headline, "Please try again later." subline, the configured server URL in mono font, and a "Retry" button that re-runs `boot()`.
+- `boot()` now calls `api.probe()` first. If unreachable, renders the error screen and returns. If reachable, proceeds to the normal saved-session restore / auth flow.
+- `public/styles.css` — `.error-shell` (full-height grid centering, starfield + nebula backdrop), `.error-card` (cosmic gradient card with plasma-glow shadow), `.broken-cable` (160px-wide SVG with plasma drop-shadow).
+- `public/index.html` — added `klar-broken-cable` to the inline-SVG sprite. Two RJ-45-shaped plug ends with internal pin lines, jagged plasma-red break + spark dots in the middle. Sized 120×64.
+
+**Fix #3 — bumped version to 0.1.1, snapshotted, rebuilt EXE.** `package.json` 0.1.0 → 0.1.1, `npm run release-client` snapshotted into `client-releases/0.1.1/` (5 files, fresh sha256s) and updated `client-releases/manifest.json` to point at 0.1.1. EXE rebuilt via `npm run dist`.
+
+**Fix #4 — git init + push to `ThatsALotOfBees/Klar`.**
+- `.gitignore` was missing `dist/` (and `*.log`); added them.
+- `git init -b main` → `git add .` (31 files / 17,618 lines after gitignore filtering — clean, no node_modules / DB / EXE / logs leaked through).
+- Initial commit message documents the full MVP scope (server, client, desktop, auto-update, build).
+- `git remote add origin https://github.com/ThatsALotOfBees/Klar.git` → `git push -u origin main` → success, `main -> main`. Repo was empty pre-push so no force/merge dance needed.
+- Existing git config picked up: `user.name = ThatsALotOfBees`, `user.email = crystanixos@gmail.com`.
+
+**Fix #5 — `client-config.json` updated** to point at the user's repo: `updateRepo: "ThatsALotOfBees/Klar"`. The new EXE bundle includes this, so installed copies will start polling `https://raw.githubusercontent.com/ThatsALotOfBees/Klar/main/client-releases/manifest.json` from their first boot.
+
+**Decisions:**
+- **Probe URL = `/api/me` not a dedicated `/api/health`.** Adding a health endpoint would mean a server-side change too. `/api/me` already returns 401 without auth (= server is up), and any failure to even get an HTTP response (= server is down) trips the unreachable branch. One less moving part.
+- **3.5-second timeout.** Long enough for a slow first DNS+TLS handshake to a faraway server; short enough that the user doesn't stare at unstyled HTML for a noticeable moment if the server is gone.
+- **Retry runs the full `boot()` again** (probe + saved session + render). Simpler than threading the flow back into auth restore and easier to reason about.
+- **Broken cable as a single inline SVG symbol**, not an external image. Same machinery as the rest of the icon sprite. No network needed to render it (relevant — we're rendering it precisely *because* the network is broken).
+
+**Verification:**
+- `node --check` clean on `public/api.js`, `public/app.js`.
+- Initial `client-releases/0.1.1/` snapshot succeeded (5 files, sha256s, manifest updated).
+- `git push` succeeded — repo at `https://github.com/ThatsALotOfBees/Klar` now contains source + `client-releases/`.
+- EXE rebuild kicked off via `npm run dist`; success criterion is `dist/Klar-0.1.1-portable.exe` showing up.
+
+**Open / next:**
+- **Real-server URL.** `client-config.json` still has `serverUrl: "http://localhost:3000"`. Once you have a publicly-reachable host (a domain, a tunnel, a VPS), update it and run `npm run release-client && npm run dist` again — that pushes the new URL to all installed EXEs via auto-update *and* produces a freshly-baked EXE for new installs.
+- **GitHub Releases for the EXE.** Right now the auto-update mechanism only updates client files. The EXE itself is committed nowhere automatic — for the user to download the latest, you'd manually upload `dist/Klar-0.1.1-portable.exe` as a release asset. `gh release create v0.1.1 dist/Klar-0.1.1-portable.exe` once you have the EXE built.
+- **Connectivity heartbeat.** Right now we only probe once at boot. If the server goes down mid-session the user sees individual request errors. A tiny WS-driven heartbeat that flips to the error screen on disconnect (with auto-reconnect) would close that gap.
+
 ## Roadmap (post-MVP)
 
 - Forward secrecy via Double Ratchet or MLS.
