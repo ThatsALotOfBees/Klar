@@ -1,0 +1,28 @@
+{
+  "version": "0.1.1",
+  "releasedAt": "2026-05-06T21:42:18.374Z",
+  "serverUrl": "http://localhost:3000",
+  "files": [
+    {
+      "path": "api.js",
+      "sha256": "9793cd36f39e910c3e468813fe0dbbfd07f73a966a11da7df0676ba67ba865b1"
+    },
+    {
+      "path": "app.js",
+      "sha256": "a564514372a9523db9eb6c12d1a8827493fee772f536cf976c9ac30c97c542f8"
+    },
+    {
+      "path": "crypto.js",
+      "sha256": "af561b22a05ada22d8a766f57605af976adbd6428264041ec991e40ae0c97088"
+    },
+    {
+      "path": "index.html",
+      "sha256": "5cd3816e700c9765fd7dda6d3cacdb1b67b5263958add13911f186cbb840caba"
+    },
+    {
+      "path": "styles.css",
+      "sha256": "23f69e34fa417342f68288d6ea0c5aea2377c981e1a7a72eee22a19dcd94c4f8"
+    }
+  ],
+  "notes": null
+}

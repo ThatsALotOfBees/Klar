@@ -1,0 +1,63 @@
+{
+  "name": "klar",
+  "version": "0.1.1",
+  "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
+  "type": "module",
+  "main": "desktop/main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --watch --disable-warning=ExperimentalWarning server.js",
+    "app": "node desktop/launch.cjs",
+    "app:dev": "node desktop/launch.cjs --dev",
+    "dist": "node desktop/build.cjs",
+    "dist:dir": "node desktop/build.cjs --dir",
+    "release-client": "node scripts/release-client.cjs"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "chat.klar.desktop",
+    "productName": "Klar",
+    "asar": false,
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "server.js",
+      "client-config.json",
+      "package.json",
+      "!**/.gitignore",
+      "!**/*.md",
+      "!klar.db",
+      "!klar.db-*",
+      "!klar.log",
+      "!klar.err.log",
+      "!.klar.pid",
+      "!messages/**",
+      "!DATA/**",
+      "!dist/**",
+      "!client-releases/**",
+      "!scripts/**"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Klar-${version}-portable.exe"
+    }
+  }
+}

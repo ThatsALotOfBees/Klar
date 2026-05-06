@@ -1,0 +1,15 @@
+node_modules/
+dist/
+klar.db
+klar.db-journal
+klar.db-wal
+klar.db-shm
+klar.log
+klar.err.log
+.klar.pid
+messages/
+DATA/
+.env
+.DS_Store
+/tmp/
+*.log
