@@ -179,6 +179,43 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 `);
 
+// ---------- Structured logging ----------
+//
+// Every event the server handles gets a timestamped, level-tagged line on
+// stdout, so the dev shell's `up` / `logs` / `tail` commands give a live
+// feed of what's happening. Format:
+//   [2026-05-07T01:23:45.678Z] INFO  ws.connect            user=alice n=2
+// Level columns are width-aligned and category strings are short tokens,
+// so `grep ws.` or `grep auth.` filters cleanly.
+
+function _logFmt(level, category, message, extra) {
+  const ts = new Date().toISOString();
+  let out = `[${ts}] ${level.padEnd(5)} ${category.padEnd(22)} ${message || ''}`;
+  if (extra && typeof extra === 'object') {
+    const parts = [];
+    for (const k of Object.keys(extra)) {
+      const v = extra[k];
+      if (v === undefined || v === null) continue;
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      parts.push(`${k}=${s}`);
+    }
+    if (parts.length) out += (message ? ' ' : '') + parts.join(' ');
+  }
+  return out;
+}
+const log = {
+  info:  (cat, msg, extra) => console.log(_logFmt('INFO',  cat, msg, extra)),
+  warn:  (cat, msg, extra) => console.log(_logFmt('WARN',  cat, msg, extra)),
+  error: (cat, msg, extra) => console.error(_logFmt('ERROR', cat, msg, extra)),
+};
+
+log.info('server.boot', 'starting', {
+  port: Number(process.env.PORT) || 3000,
+  pid: process.pid,
+  node: process.version,
+  dataDir: DATA_ROOT,
+});
+
 const newId = () => crypto.randomBytes(12).toString('hex');
 const newToken = () => crypto.randomBytes(32).toString('base64url');
 const newInviteCode = () => crypto.randomBytes(6).toString('base64url').replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || crypto.randomBytes(6).toString('hex');
@@ -429,9 +466,11 @@ function exportExistingAccountsToKdb() {
 
 const accountsRestored = loadAccountsFromKdb();
 const accountsExported = exportExistingAccountsToKdb();
-if (accountsRestored || accountsExported) {
-  console.log(`Klar accounts: restored ${accountsRestored} from KDB, exported ${accountsExported} to KDB`);
-}
+log.info('accounts.kdb', 'KDB sync done', {
+  restored: accountsRestored,
+  exported: accountsExported,
+  dir: path.relative(__dirname, ACCOUNTS_DIR),
+});
 
 function send(res, status, body, headers = {}) {
   const data = typeof body === 'string' ? body : JSON.stringify(body);
@@ -528,6 +567,7 @@ route('POST', /^\/api\/register$/, async (req, res) => {
     .run(token, id, Date.now(), Date.now() + SESSION_TTL_MS);
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   writeAccountKdb(user);
+  log.info('auth.register', 'new account', { user: user.username, id: user.id });
   send(res, 200, { token, user: selfUser(user) });
 });
 
@@ -535,16 +575,27 @@ route('POST', /^\/api\/login$/, async (req, res) => {
   const { username, password } = await readJson(req);
   if (typeof username !== 'string' || typeof password !== 'string') return sendError(res, 400, 'username and password required');
   const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username.toLowerCase());
-  if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) return sendError(res, 401, 'invalid credentials');
+  if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
+    log.warn('auth.login', 'invalid credentials', { user: String(username).toLowerCase() });
+    return sendError(res, 401, 'invalid credentials');
+  }
   const token = newToken();
   db.prepare('INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)')
     .run(token, user.id, Date.now(), Date.now() + SESSION_TTL_MS);
+  log.info('auth.login', 'logged in', { user: user.username });
   send(res, 200, { token, user: selfUser(user) });
 });
 
 route('POST', /^\/api\/logout$/, async (req, res) => {
   const auth = req.headers['authorization'];
-  if (auth?.startsWith('Bearer ')) db.prepare('DELETE FROM sessions WHERE token = ?').run(auth.slice(7));
+  let username = null;
+  if (auth?.startsWith('Bearer ')) {
+    const token = auth.slice(7);
+    const u = getUserByToken(token);
+    if (u) username = u.username;
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  }
+  log.info('auth.logout', 'session ended', { user: username || '(unknown)' });
   send(res, 200, { ok: true });
 });
 
@@ -594,6 +645,7 @@ route('POST', /^\/api\/dms$/, async (req, res) => {
     db.prepare('INSERT INTO dms (id, user_a, user_b, e2ee_enabled, created_at) VALUES (?,?,?,0,?)')
       .run(id, a, b, Date.now());
     dm = db.prepare('SELECT * FROM dms WHERE id = ?').get(id);
+    log.info('dm.create', 'new dm', { dm: dm.id, a: me.username, b: other.username });
     const payload = { type: 'dm_created', dm: { ...dmRow(dm), other: publicUser(me), lastAt: dm.created_at } };
     broadcastToUser(other.id, payload);
   }
@@ -609,6 +661,7 @@ route('PATCH', /^\/api\/dms\/([a-f0-9]+)$/, async (req, res, [, dmId]) => {
   if (typeof e2eeEnabled !== 'boolean') return sendError(res, 400, 'e2eeEnabled must be boolean');
   db.prepare('UPDATE dms SET e2ee_enabled = ? WHERE id = ?').run(e2eeEnabled ? 1 : 0, dm.id);
   const updated = db.prepare('SELECT * FROM dms WHERE id = ?').get(dm.id);
+  log.info('dm.e2ee', 'toggled', { dm: dm.id, by: me.username, enabled: e2eeEnabled });
   const payload = { type: 'dm_updated', dmId: dm.id, e2eeEnabled };
   broadcastToUser(dm.user_a, payload);
   broadcastToUser(dm.user_b, payload);
@@ -654,6 +707,12 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   const userB = db.prepare('SELECT username FROM users WHERE id = ?').get(dm.user_b);
   if (userA && userB) appendKdb(userA.username, userB.username, me.username, message);
 
+  log.info('msg.dm', 'message sent', {
+    dm: dm.id, from: me.username,
+    to: (me.id === dm.user_a ? userB && userB.username : userA && userA.username) || '?',
+    encrypted: !!encrypted, bytes: (content || '').length,
+  });
+
   const payload = { type: 'message', message };
   broadcastToUser(dm.user_a, payload);
   if (dm.user_a !== dm.user_b) broadcastToUser(dm.user_b, payload);
@@ -697,6 +756,7 @@ route('POST', /^\/api\/servers$/, async (req, res) => {
   const channelId = newId();
   db.prepare('INSERT INTO channels (id, server_id, name, position, created_at) VALUES (?,?,?,?,?)').run(channelId, id, 'general', 0, now);
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(id);
+  log.info('server.create', 'new server', { server: id, name: trimmed, owner: me.username });
   send(res, 200, { server: publicServer(server) });
 });
 
@@ -739,6 +799,7 @@ route('DELETE', /^\/api\/servers\/([a-f0-9]+)$/, async (req, res, [, serverId]) 
   // Notify members before we delete (so they can clean up local state).
   broadcastToServer(serverId, { type: 'server_deleted', serverId });
   db.prepare('DELETE FROM servers WHERE id = ?').run(serverId);
+  log.info('server.delete', 'deleted', { server: serverId, by: me.username });
   send(res, 200, { ok: true });
 });
 
@@ -748,6 +809,7 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/leave$/, async (req, res, [, server
   if (userOwnsServer(me.id, serverId)) return sendError(res, 400, 'owner cannot leave their own server (delete it instead)');
   if (!userIsServerMember(me.id, serverId)) return sendError(res, 404, 'server not found');
   db.prepare('DELETE FROM server_members WHERE server_id = ? AND user_id = ?').run(serverId, me.id);
+  log.info('server.leave', 'member left', { server: serverId, user: me.username });
   broadcastToServer(serverId, { type: 'server_member_left', serverId, userId: me.id });
   send(res, 200, { ok: true });
 });
@@ -764,6 +826,7 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/channels$/, async (req, res, [, ser
   const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM channels WHERE server_id = ?').get(serverId).p;
   db.prepare('INSERT INTO channels (id, server_id, name, position, created_at) VALUES (?,?,?,?,?)').run(id, serverId, candidate, maxPos + 1, now);
   const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
+  log.info('channel.create', 'new channel', { server: serverId, channel: id, name: candidate, by: me.username });
   const payload = { type: 'channel_created', channel: channelRow(ch) };
   broadcastToServer(serverId, payload);
   send(res, 200, { channel: channelRow(ch) });
@@ -801,6 +864,10 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(ch.server_id);
   appendKdbChannel(server, ch, me.username, message);
 
+  log.info('msg.channel', 'message sent', {
+    server: ch.server_id, channel: ch.name, from: me.username, bytes: content.length,
+  });
+
   broadcastToServer(ch.server_id, { type: 'channel_message', message });
   send(res, 200, { message });
 });
@@ -814,6 +881,7 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/invites$/, async (req, res, [, serv
   const code = newInviteCode();
   const now = Date.now();
   db.prepare('INSERT INTO invites (code, server_id, inviter_id, created_at) VALUES (?,?,?,?)').run(code, serverId, me.id, now);
+  log.info('invite.create', 'invite generated', { server: serverId, by: me.username, code });
   send(res, 200, { code });
 });
 
@@ -837,7 +905,10 @@ route('POST', /^\/api\/invites\/([A-Za-z0-9]+)\/accept$/, async (req, res, [, co
   if (!already) {
     db.prepare('INSERT INTO server_members (server_id, user_id, joined_at) VALUES (?,?,?)').run(inv.server_id, me.id, Date.now());
     db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?').run(code);
+    log.info('invite.accept', 'member joined', { server: inv.server_id, user: me.username, code });
     broadcastToServer(inv.server_id, { type: 'server_member_joined', serverId: inv.server_id, user: publicUser(me) });
+  } else {
+    log.info('invite.accept', 'already a member', { server: inv.server_id, user: me.username, code });
   }
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(inv.server_id);
   send(res, 200, { server: publicServer(server), alreadyMember: already });
@@ -860,7 +931,7 @@ const server = http.createServer(async (req, res) => {
     }
     return serveStatic(req, res);
   } catch (e) {
-    console.error('request error', e);
+    log.error('http.error', e.message || String(e), { url: req.url, method: req.method });
     if (!res.headersSent) sendError(res, 500, e.message || 'internal error');
   }
 });
@@ -870,34 +941,69 @@ server.on('upgrade', (req, socket, head) => {
   if (!req.url.startsWith('/ws')) { socket.destroy(); return; }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
 });
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   ws.userId = null;
+  ws.username = null;
+  ws._ip = (req && req.socket && req.socket.remoteAddress) || 'unknown';
+  log.info('ws.open', 'connection opened', { ip: ws._ip });
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'auth') {
       const user = getUserByToken(msg.token);
-      if (!user) return ws.send(JSON.stringify({ type: 'auth_fail' }));
+      if (!user) {
+        log.warn('ws.auth', 'auth_fail', { ip: ws._ip });
+        return ws.send(JSON.stringify({ type: 'auth_fail' }));
+      }
       ws.userId = user.id;
+      ws.username = user.username;
       if (!sockets.has(user.id)) sockets.set(user.id, new Set());
       sockets.get(user.id).add(ws);
+      log.info('ws.auth', 'authed', { user: user.username, sockets: sockets.get(user.id).size });
       ws.send(JSON.stringify({ type: 'auth_ok' }));
     } else if (msg.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong' }));
     }
   });
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     if (ws.userId && sockets.has(ws.userId)) {
       const set = sockets.get(ws.userId);
       set.delete(ws);
       if (set.size === 0) sockets.delete(ws.userId);
+      log.info('ws.close', 'connection closed', {
+        user: ws.username || '(unauth)',
+        code,
+        remaining: set.size,
+      });
+    } else {
+      log.info('ws.close', 'connection closed (unauth)', { code });
     }
   });
 });
 
 server.listen(PORT, () => {
+  // Keep the legacy "running at http://..." line so the Electron desktop
+  // shell's regex parser still detects readiness — it's the de-facto
+  // contract between server.js and desktop/main.cjs.
   console.log(`Klar server running at http://localhost:${PORT}`);
+  log.info('server.listen', 'ready', { url: `http://localhost:${PORT}` });
 });
+
+function gracefulShutdown(signal) {
+  log.info('server.shutdown', 'signal received', { signal });
+  let closed = false;
+  setTimeout(() => { if (!closed) { log.warn('server.shutdown', 'forced exit (timeout)'); process.exit(0); } }, 3000);
+  server.close(() => {
+    closed = true;
+    log.info('server.shutdown', 'http closed');
+    try { db.close(); log.info('server.shutdown', 'db closed'); } catch (e) { log.error('server.shutdown', 'db close failed', { err: e.message }); }
+    process.exit(0);
+  });
+}
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('uncaughtException', (e) => log.error('process.uncaught', e.message, { stack: e.stack }));
+process.on('unhandledRejection', (e) => log.error('process.unhandled', String(e && e.message || e)));
 
 // Exported so the Electron main process can import this module and wait for
 // the HTTP server to be listening before opening the BrowserWindow.

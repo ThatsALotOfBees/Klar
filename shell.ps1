@@ -2,12 +2,16 @@
 # the server. Loaded by klar.cmd (or dot-source it yourself: `. .\shell.ps1`).
 
 $KlarRoot       = $PSScriptRoot
-$Global:KlarPort     = if ($env:PORT) { [int]$env:PORT } else { 3000 }
-$Global:KlarLogFile  = Join-Path $KlarRoot 'klar.log'
-$Global:KlarErrFile  = Join-Path $KlarRoot 'klar.err.log'
-$Global:KlarPidFile  = Join-Path $KlarRoot '.klar.pid'
-$Global:KlarDbFile   = Join-Path $KlarRoot 'klar.db'
-$Global:KlarPkgFile  = Join-Path $KlarRoot 'package.json'
+$Global:KlarPort           = if ($env:PORT) { [int]$env:PORT } else { 3000 }
+$Global:KlarLogFile        = Join-Path $KlarRoot 'klar.log'
+$Global:KlarErrFile        = Join-Path $KlarRoot 'klar.err.log'
+$Global:KlarPidFile        = Join-Path $KlarRoot '.klar.pid'
+$Global:KlarDbFile         = Join-Path $KlarRoot 'klar.db'
+$Global:KlarPkgFile        = Join-Path $KlarRoot 'package.json'
+$Global:KlarTunnelLogFile  = Join-Path $KlarRoot 'klar.tunnel.log'
+$Global:KlarTunnelErrFile  = Join-Path $KlarRoot 'klar.tunnel.err.log'
+$Global:KlarTunnelPidFile  = Join-Path $KlarRoot '.klar.tunnel.pid'
+$Global:KlarConfigFile     = Join-Path $KlarRoot 'client-config.json'
 
 Set-Location $KlarRoot
 
@@ -26,6 +30,36 @@ function Get-KlarPid {
     return $null
 }
 
+function Get-KlarTunnelPid {
+    if (-not (Test-Path $Global:KlarTunnelPidFile)) { return $null }
+    $raw = Get-Content $Global:KlarTunnelPidFile -ErrorAction SilentlyContinue
+    if (-not $raw) { return $null }
+    $procPid = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$procPid)) {
+        Remove-Item $Global:KlarTunnelPidFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    $proc = Get-Process -Id $procPid -ErrorAction SilentlyContinue
+    if ($proc -and $proc.ProcessName -match 'node') { return $procPid }
+    Remove-Item $Global:KlarTunnelPidFile -Force -ErrorAction SilentlyContinue
+    return $null
+}
+
+function Get-KlarTunnelSubdomain {
+    if (-not (Test-Path $Global:KlarConfigFile)) { return $null }
+    try {
+        $cfg = Get-Content $Global:KlarConfigFile -Raw | ConvertFrom-Json
+        return $cfg.tunnelSubdomain
+    } catch { return $null }
+}
+
+function Get-KlarTunnelUrl {
+    if (-not (Test-Path $Global:KlarTunnelLogFile)) { return $null }
+    $line = Select-String -Path $Global:KlarTunnelLogFile -Pattern 'https?://[^\s]+' -List -ErrorAction SilentlyContinue
+    if ($line -and $line.Matches[0]) { return $line.Matches[0].Value }
+    return $null
+}
+
 function Test-KlarSetup {
     if (-not (Test-Path (Join-Path $KlarRoot 'node_modules'))) {
         Write-Host "node_modules missing - run 'setup' first." -ForegroundColor Yellow
@@ -41,11 +75,11 @@ function Klar-Help {
     $rows = @(
         ,@('help',       'Show this help')
         ,@('serve',      'Run server in foreground (Ctrl+C to stop)')
-        ,@('up',         'Start server in background, log to klar.log')
-        ,@('down',       'Stop the background server')
+        ,@('up [-NoTunnel]', 'Start server + public tunnel in background')
+        ,@('down',       'Stop the background server + tunnel')
         ,@('restart',    'Stop, then start in background')
-        ,@('status',     'Show running state, port, pid, db size')
-        ,@('logs [-n N]','Show last N lines of klar.log (default 50)')
+        ,@('status',     'Show server + tunnel state, public URL, db size')
+        ,@('logs [-n N]','Show last N lines of klar.log + tunnel log (default 50)')
         ,@('tail',       'Follow klar.log live (Ctrl+C to stop)')
         ,@('open-app',   'Open http://localhost:<port> in default browser')
         ,@('port [n]',   'Show or set the server port')
@@ -79,12 +113,17 @@ function Invoke-KlarServe {
 Set-Alias serve Invoke-KlarServe -Scope Global
 
 function Start-KlarBackground {
+    [CmdletBinding()]
+    param([switch]$NoTunnel)
+
     if (-not (Test-KlarSetup)) { return }
     $existing = Get-KlarPid
     if ($existing) {
         Write-Host "Already running (pid $existing) on port $($Global:KlarPort)." -ForegroundColor Yellow
         return
     }
+
+    # ---- spawn server.js ----
     if (Test-Path $Global:KlarLogFile) { Remove-Item $Global:KlarLogFile -Force }
     if (Test-Path $Global:KlarErrFile) { Remove-Item $Global:KlarErrFile -Force }
     $env:PORT = "$($Global:KlarPort)"
@@ -96,31 +135,80 @@ function Start-KlarBackground {
         -WindowStyle Hidden `
         -PassThru
     "$($proc.Id)" | Set-Content -Path $Global:KlarPidFile -Encoding ascii
-    Start-Sleep -Milliseconds 600
-    if (Get-KlarPid) {
-        Write-Host "Klar started (pid $($proc.Id)) on http://localhost:$($Global:KlarPort)" -ForegroundColor Green
-        Write-Host "Logs: $Global:KlarLogFile  (use 'logs' or 'tail')" -ForegroundColor DarkGray
-    } else {
+    Start-Sleep -Milliseconds 800
+    if (-not (Get-KlarPid)) {
         Write-Host "Server crashed during startup. Last log lines:" -ForegroundColor Red
         if (Test-Path $Global:KlarErrFile) { Get-Content $Global:KlarErrFile -Tail 20 }
         if (Test-Path $Global:KlarLogFile) { Get-Content $Global:KlarLogFile -Tail 20 }
+        return
     }
+    Write-Host "Klar server started (pid $($proc.Id)) on http://localhost:$($Global:KlarPort)" -ForegroundColor Green
+
+    # ---- spawn tunnel (unless -NoTunnel or no localtunnel installed) ----
+    if ($NoTunnel) {
+        Write-Host "Tunnel skipped (-NoTunnel)." -ForegroundColor DarkGray
+        return
+    }
+    $ltJs = Join-Path $KlarRoot 'node_modules\localtunnel\bin\lt.js'
+    if (-not (Test-Path $ltJs)) {
+        Write-Host "Tunnel skipped (localtunnel not installed; run 'setup')." -ForegroundColor DarkGray
+        return
+    }
+    $sub = Get-KlarTunnelSubdomain
+    $ltArgs = @($ltJs, '--port', "$($Global:KlarPort)")
+    if ($sub) { $ltArgs += @('--subdomain', $sub) }
+
+    if (Test-Path $Global:KlarTunnelLogFile) { Remove-Item $Global:KlarTunnelLogFile -Force }
+    if (Test-Path $Global:KlarTunnelErrFile) { Remove-Item $Global:KlarTunnelErrFile -Force }
+    $tunnelProc = Start-Process node `
+        -ArgumentList $ltArgs `
+        -WorkingDirectory $KlarRoot `
+        -RedirectStandardOutput $Global:KlarTunnelLogFile `
+        -RedirectStandardError  $Global:KlarTunnelErrFile `
+        -WindowStyle Hidden `
+        -PassThru
+    "$($tunnelProc.Id)" | Set-Content -Path $Global:KlarTunnelPidFile -Encoding ascii
+    Start-Sleep -Milliseconds 2500
+    if (Get-KlarTunnelPid) {
+        $url = Get-KlarTunnelUrl
+        if ($url) {
+            Write-Host "Klar tunnel up:  $url" -ForegroundColor Cyan
+        } else {
+            Write-Host "Klar tunnel started (pid $($tunnelProc.Id)) but no URL yet - check 'logs'." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "Tunnel failed to start. Tail of klar.tunnel.log:" -ForegroundColor Red
+        if (Test-Path $Global:KlarTunnelLogFile) { Get-Content $Global:KlarTunnelLogFile -Tail 20 }
+    }
+    Write-Host "Logs: $Global:KlarLogFile  (use 'logs' or 'tail')" -ForegroundColor DarkGray
 }
 Set-Alias up Start-KlarBackground -Scope Global
 
 function Stop-KlarBackground {
     $serverPid = Get-KlarPid
-    if (-not $serverPid) {
-        Write-Host "No background server running." -ForegroundColor DarkGray
+    $tunnelPid = Get-KlarTunnelPid
+    if (-not $serverPid -and -not $tunnelPid) {
+        Write-Host "Nothing running." -ForegroundColor DarkGray
         return
     }
-    try {
-        Stop-Process -Id $serverPid -Force -ErrorAction Stop
-        Write-Host "Stopped pid $serverPid." -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to stop pid ${serverPid}: $($_.Exception.Message)" -ForegroundColor Red
+    if ($tunnelPid) {
+        try {
+            Stop-Process -Id $tunnelPid -Force -ErrorAction Stop
+            Write-Host "Stopped tunnel (pid $tunnelPid)." -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to stop tunnel pid ${tunnelPid}: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Remove-Item $Global:KlarTunnelPidFile -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item $Global:KlarPidFile -Force -ErrorAction SilentlyContinue
+    if ($serverPid) {
+        try {
+            Stop-Process -Id $serverPid -Force -ErrorAction Stop
+            Write-Host "Stopped server (pid $serverPid)." -ForegroundColor Green
+        } catch {
+            Write-Host "Failed to stop server pid ${serverPid}: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Remove-Item $Global:KlarPidFile -Force -ErrorAction SilentlyContinue
+    }
 }
 Set-Alias down Stop-KlarBackground -Scope Global
 
@@ -133,19 +221,31 @@ Set-Alias restart Restart-KlarBackground -Scope Global
 
 function Get-KlarStatus {
     $serverPid = Get-KlarPid
+    $tunnelPid = Get-KlarTunnelPid
     Write-Host ""
     Write-Host "  Klar status" -ForegroundColor Cyan
     Write-Host "  -----------" -ForegroundColor DarkGray
     if ($serverPid) {
-        Write-Host ("  state    : ") -NoNewline -ForegroundColor DarkGray
-        Write-Host "running" -ForegroundColor Green
-        Write-Host ("  pid      : $serverPid") -ForegroundColor Gray
+        Write-Host ("  server   : ") -NoNewline -ForegroundColor DarkGray
+        Write-Host "running (pid $serverPid)" -ForegroundColor Green
     } else {
-        Write-Host ("  state    : ") -NoNewline -ForegroundColor DarkGray
+        Write-Host ("  server   : ") -NoNewline -ForegroundColor DarkGray
         Write-Host "stopped" -ForegroundColor Yellow
     }
     Write-Host ("  port     : $($Global:KlarPort)") -ForegroundColor Gray
     Write-Host ("  url      : http://localhost:$($Global:KlarPort)") -ForegroundColor Gray
+    if ($tunnelPid) {
+        $tunnelUrl = Get-KlarTunnelUrl
+        Write-Host ("  tunnel   : ") -NoNewline -ForegroundColor DarkGray
+        Write-Host "running (pid $tunnelPid)" -ForegroundColor Green
+        if ($tunnelUrl) {
+            Write-Host ("  public   : ") -NoNewline -ForegroundColor DarkGray
+            Write-Host $tunnelUrl -ForegroundColor Cyan
+        }
+    } else {
+        Write-Host ("  tunnel   : ") -NoNewline -ForegroundColor DarkGray
+        Write-Host "stopped" -ForegroundColor Yellow
+    }
     if (Test-Path $Global:KlarDbFile) {
         $size = (Get-Item $Global:KlarDbFile).Length
         Write-Host ("  database : $('{0:N0}' -f $size) bytes  ($Global:KlarDbFile)") -ForegroundColor Gray
@@ -167,10 +267,15 @@ function Show-KlarLogs {
         Write-Host "No log file yet - run 'up' first." -ForegroundColor DarkGray
         return
     }
+    Write-Host "--- klar.log (last $n lines) ---" -ForegroundColor Cyan
     Get-Content $Global:KlarLogFile -Tail $n
     if ((Test-Path $Global:KlarErrFile) -and (Get-Item $Global:KlarErrFile).Length -gt 0) {
-        Write-Host "--- stderr ---" -ForegroundColor Yellow
+        Write-Host "`n--- klar.err.log ---" -ForegroundColor Yellow
         Get-Content $Global:KlarErrFile -Tail $n
+    }
+    if (Test-Path $Global:KlarTunnelLogFile) {
+        Write-Host "`n--- klar.tunnel.log ---" -ForegroundColor Cyan
+        Get-Content $Global:KlarTunnelLogFile -Tail $n
     }
 }
 Set-Alias logs Show-KlarLogs -Scope Global
@@ -300,7 +405,7 @@ function Invoke-KlarTunnel {
         }
     }
 
-    # Make sure the local server is up before opening the tunnel — otherwise
+    # Make sure the local server is up before opening the tunnel - otherwise
     # localtunnel's URL would point at nothing.
     if (-not $NoStart) {
         $serverPid = Get-KlarPid
@@ -323,7 +428,7 @@ function Invoke-KlarTunnel {
         Write-Host "  Klar is going public on the stable URL:" -ForegroundColor Cyan
         Write-Host "    https://$Subdomain.loca.lt" -ForegroundColor Green
         Write-Host "  Friends running the distributed EXE/MSI will reach it" -ForegroundColor DarkGray
-        Write-Host "  automatically — no env vars, no config on their side." -ForegroundColor DarkGray
+        Write-Host "  automatically - no env vars, no config on their side." -ForegroundColor DarkGray
     } else {
         Write-Host "  Opening tunnel to localhost:$($Global:KlarPort) (random URL)..." -ForegroundColor Cyan
     }

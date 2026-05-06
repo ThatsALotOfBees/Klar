@@ -6,7 +6,10 @@ klar.db-wal
 klar.db-shm
 klar.log
 klar.err.log
+klar.tunnel.log
+klar.tunnel.err.log
 .klar.pid
+.klar.tunnel.pid
 messages/
 DATA/
 .env
