@@ -1,11 +1,11 @@
 {
-  "version": "0.1.2",
-  "releasedAt": "2026-05-06T22:01:29.185Z",
+  "version": "0.1.3",
+  "releasedAt": "2026-05-06T22:24:48.818Z",
   "serverUrl": "http://localhost:3000",
   "files": [
     {
       "path": "api.js",
-      "sha256": "9793cd36f39e910c3e468813fe0dbbfd07f73a966a11da7df0676ba67ba865b1"
+      "sha256": "ee044060713958e6b170fc4ba56a35f269caccc0a20b11a00326a4fd2e47cb91"
     },
     {
       "path": "app.js",

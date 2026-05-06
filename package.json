@@ -1,6 +1,6 @@
 {
   "name": "klar",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
   "author": "ThatsALotOfBees",
   "type": "module",
@@ -23,7 +23,8 @@
   },
   "devDependencies": {
     "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "localtunnel": "^2.0.2"
   },
   "build": {
     "appId": "chat.klar.desktop",

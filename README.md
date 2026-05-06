@@ -738,11 +738,16 @@ The renderer was doing exactly what it was told: every message had the same `sen
 1. `desktop/build.cjs` was defaulting to `--win portable` when called with no args, which **overrode** the new `build.win.target` array in `package.json` and caused the MSI target to be silently skipped. Changed the default to plain `--win` so electron-builder honors the configured target list.
 2. WiX failed with `LGHT0094: identifier 'Icon:KlarIcon.exe' could not be found`. electron-builder's MSI WXS template references the app icon for the desktop / start-menu shortcuts, but no `build/icon.ico` existed. Wrote `scripts/make-icon.cjs` that programmatically generates a 5-size ICO (32, 48, 64, 128, 256) of a plasma-purple orb with a few crater spots — pure Node, no graphics tools, no checked-in binary asset. Added `build.win.icon: "build/icon.ico"` to package.json. Also added `"author": "ThatsALotOfBees"` so MSI gets a proper Manufacturer field.
 
-**Cross-internet testing checklist** (added to "Open / next" because it's user-side work):
-1. Make your local server reachable on the public internet. Cheapest: `cloudflared tunnel --url http://localhost:3000` (free, gives a `*.trycloudflare.com` URL). Alternatives: `ngrok`, port-forwarded home server with a domain, or a small VPS.
-2. Edit `client-config.json`: set `serverUrl` to that public URL.
-3. `npm run dist` again to bake the new URL into the installers.
-4. Hand the resulting `dist/Klar-<v>.msi` (or portable EXE) to a friend on a different network. Install it, log in. Messages should round-trip back to your machine.
+**Cross-internet testing checklist:**
+1. Open the dev shell (`klar.cmd`) and run `tunnel`. This starts the local Klar server (if it isn't already running) and opens a public `https://*.loca.lt` URL pointing at it via [localtunnel](https://github.com/localtunnel/localtunnel) — no Cloudflare account, no separate binary, just a Node dep.
+2. Hand the printed URL to your tester along with `dist/Klar-<v>.msi`.
+3. Tester installs Klar, opens cmd.exe, runs:
+   ```cmd
+   set KLAR_SERVER_URL=https://<your-tunnel>.loca.lt
+   start "" "%LOCALAPPDATA%\Programs\Klar\Klar.exe"
+   ```
+   That env var override beats whatever's baked into `client-config.json` for that single launch. They register, log in, and messages roundtrip back to your machine through the tunnel.
+4. To make the URL the default for all future launches without env-var fiddling, edit `client-config.json` to that URL and run `npm run dist` again before redistributing.
 
 **Verification:**
 - `npm run release-client` produced `client-releases/0.1.2/` cleanly. Manifest now reports `version: "0.1.2"`.
@@ -752,6 +757,39 @@ The renderer was doing exactly what it was told: every message had the same `sen
 - **Server URL.** `client-config.json` still has `serverUrl: "http://localhost:3000"`. The MSI/EXE will install fine, run, and immediately render the broken-cable error screen on the remote PC. To make actual chat work end-to-end, follow the cross-internet checklist above.
 - **MSI app icon.** Like the portable EXE, the MSI ships with the default Electron icon. Adding `build/icon.ico` and re-enabling `signAndEditExecutable: true` (after dealing with WiX symlink permissions) would brand it.
 - **GitHub Release for the MSI.** `gh release create v0.1.2 dist/Klar-0.1.2.msi dist/Klar-0.1.2-portable.exe` once both artifacts exist; the user can then send a release URL instead of an EXE/MSI file.
+
+### 2026-05-07 — `tunnel` command for cross-network testing (no Cloudflare)
+**Goal:** User asked for a single dev-shell command they can run to expose the local server publicly so a tester on a different network can install the client and chat. Explicitly didn't want Cloudflare.
+
+**Tunneling tool: `localtunnel`.** Pure Node, no separate binary, no account, free. Other non-Cloudflare options considered:
+- `ngrok` — needs a binary download + a free account.
+- `ssh -R 80:localhost:3000 nokey@localhost.run` — no install at all (Windows 10 has OpenSSH built-in), but stuck behind anti-abuse rate limits and intermittent uptime.
+- `bore`, `pinggy`, `serveo` — similar trade-offs.
+
+`localtunnel` won on "fewest moving parts to install." `npm install -D localtunnel` and a 9-package transitive dep tree.
+
+**Changes:**
+- `package.json` — added `localtunnel@^2.0.2` to `devDependencies`. Bumped 0.1.2 → 0.1.3.
+- `shell.ps1` — new `tunnel [-Subdomain]` command. Checks localtunnel is installed; auto-starts the local server in background if it isn't running; prints copy-pastable tester instructions; runs `node node_modules/localtunnel/bin/lt.js --port $KlarPort` in the foreground (Ctrl+C ends the tunnel; the local server keeps running). Calls `lt.js` directly instead of through the `.cmd` shim because the shim was eating stdout when invoked from the bash test harness — direct node invocation is cleaner anyway.
+- Help-table format width bumped from `{0,-14}` to `{0,-22}` to fit the new command labels (`tunnel [-Subdomain]`, `release-client [v]`).
+- `server.js` — added `bypass-tunnel-reminder` to `Access-Control-Allow-Headers`. localtunnel injects a "click to continue" HTML reminder page on first hit per IP; without the header, JSON.parse on that HTML page would break every API call from the EXE.
+- `public/api.js` — every `request()` now sends `bypass-tunnel-reminder: klar-app`. The connectivity probe sends it too. Other tunnel providers and direct connections ignore the header — it's localtunnel-specific. Without this, a tester running the EXE through a localtunnel URL would get the reminder HTML instead of API JSON and the app would silently fail.
+- `client-releases/0.1.3/` + `manifest.json` updated to point at it. Existing 0.1.2 installs will pick up the bypass-header fix on their next poll.
+
+**Decisions:**
+- **Tunnel command is foreground.** Started in background by default, the user wouldn't see the URL. The local server already runs in background (`up`); the tunnel is the only foreground piece.
+- **Don't auto-update `client-config.json` with the tunnel URL.** Tunnels are ephemeral (random subdomain per session unless you pay for a fixed one). Baking the URL into a build that gets distributed would make the build stale within hours. Better to keep `client-config.json` pointing at a stable production URL and let testers override per-launch via `KLAR_SERVER_URL`.
+- **Don't auto-rebuild + push on `tunnel`.** The friend's tester EXE doesn't need a rebuild for each tunnel session; the `KLAR_SERVER_URL` env var is enough. Rebuilding would cost ~5 minutes for a 30-minute test session.
+
+**Verification:**
+- `npm install` added 9 packages. `node_modules/.bin/lt` and `lt.cmd` both present.
+- Direct invocation `node node_modules/localtunnel/bin/lt.js --port 3098` produced `your url is: https://real-ghosts-count.loca.lt`.
+- Roundtrip with the local server running: `curl -H 'bypass-tunnel-reminder: 1' <tunnel-url>/api/me` returned the same `HTTP 401` + `{"error":"not authenticated"}` body as the local probe, confirming the public URL proxies through to the local server.
+- `tunnel` command via the dev shell opened a tunnel and printed `your url is: https://mighty-emus-lick.loca.lt`. Wiring confirmed.
+
+**Open / next:**
+- **Custom subdomain per session.** Pass `-Subdomain my-test` to ask localtunnel for a specific subdomain (best-effort — they may already be taken). Useful if you want a stable URL across multiple tunnel sessions on the same day.
+- **Auto-update for tester EXEs.** Once the tester has installed any 0.1.x build, future client-side fixes auto-apply via the GitHub manifest poll. If you want to push *shell* changes (main.cjs, preload, electron version) the tester needs a fresh installer — plumbing for that is "open".
 
 ## Roadmap (post-MVP)
 

@@ -846,7 +846,7 @@ route('POST', /^\/api\/invites\/([A-Za-z0-9]+)\/accept$/, async (req, res, [, co
 const server = http.createServer(async (req, res) => {
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminder');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
     if (req.url.startsWith('/api/')) {

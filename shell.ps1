@@ -56,9 +56,10 @@ function Klar-Help {
         ,@('app',        'Launch the Electron desktop app (frameless window)')
         ,@('dist',       'Build a portable .exe of the desktop app (slow first time)')
         ,@('release-client [v]', 'Snapshot public/ as a new entry in client-releases/')
+        ,@('tunnel [-Subdomain]', 'Open a public *.loca.lt URL pointing at the local server (for cross-network testing)')
     )
     foreach ($r in $rows) {
-        Write-Host ("  {0,-14}" -f $r[0]) -NoNewline -ForegroundColor Green
+        Write-Host ("  {0,-22}" -f $r[0]) -NoNewline -ForegroundColor Green
         Write-Host $r[1] -ForegroundColor Gray
     }
     Write-Host ""
@@ -270,6 +271,59 @@ Set-Alias clean Clean-Klar -Scope Global
 
 function Goto-KlarHome { Set-Location $KlarRoot }
 Set-Alias home Goto-KlarHome -Scope Global
+
+function Invoke-KlarTunnel {
+    [CmdletBinding()]
+    param(
+        [string]$Subdomain = '',
+        [switch]$NoStart
+    )
+    if (-not (Test-Path (Join-Path $KlarRoot 'node_modules\localtunnel'))) {
+        Write-Host "localtunnel not installed. Run 'setup' first." -ForegroundColor Yellow
+        return
+    }
+
+    # Make sure the local server is up before opening the tunnel — otherwise
+    # localtunnel's URL would point at nothing.
+    if (-not $NoStart) {
+        $serverPid = Get-KlarPid
+        if (-not $serverPid) {
+            Write-Host "No local server running on port $($Global:KlarPort). Starting..." -ForegroundColor Cyan
+            Start-KlarBackground
+            Start-Sleep -Milliseconds 800
+            if (-not (Get-KlarPid)) {
+                Write-Host "Server didn't start cleanly. Check logs and retry." -ForegroundColor Red
+                return
+            }
+        } else {
+            Write-Host "Local server already running on port $($Global:KlarPort) (pid $serverPid)." -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  ============================================================" -ForegroundColor DarkGray
+    Write-Host "  Opening public tunnel to localhost:$($Global:KlarPort)..." -ForegroundColor Cyan
+    Write-Host "  Anyone with the printed URL can reach your local server." -ForegroundColor DarkGray
+    Write-Host "  Ctrl+C to close the tunnel; the local server keeps running." -ForegroundColor DarkGray
+    Write-Host "  ============================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Tester instructions (copy-paste this for them):" -ForegroundColor Yellow
+    Write-Host "    1. Install Klar from your dist\Klar-<v>.msi" -ForegroundColor Gray
+    Write-Host "    2. Open cmd.exe and run:" -ForegroundColor Gray
+    Write-Host "         set KLAR_SERVER_URL=<URL printed below>" -ForegroundColor Gray
+    Write-Host "         start " -NoNewline -ForegroundColor Gray
+    Write-Host '"' -NoNewline -ForegroundColor Gray
+    Write-Host '"' -NoNewline -ForegroundColor Gray
+    Write-Host " " -NoNewline -ForegroundColor Gray
+    Write-Host '"%LOCALAPPDATA%\Programs\Klar\Klar.exe"' -ForegroundColor Gray
+    Write-Host ""
+
+    $ltJs = Join-Path $KlarRoot 'node_modules\localtunnel\bin\lt.js'
+    $cmdArgs = @($ltJs, '--port', "$($Global:KlarPort)")
+    if ($Subdomain) { $cmdArgs += @('--subdomain', $Subdomain) }
+    & node @cmdArgs
+}
+Set-Alias tunnel Invoke-KlarTunnel -Scope Global
 
 function Invoke-KlarReleaseClient {
     [CmdletBinding()]
