@@ -1,7 +1,8 @@
 {
   "name": "klar",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
+  "author": "ThatsALotOfBees",
   "type": "module",
   "main": "desktop/main.cjs",
   "private": true,
@@ -52,12 +53,21 @@
     },
     "win": {
       "target": [
-        { "target": "portable", "arch": ["x64"] }
+        { "target": "portable", "arch": ["x64"] },
+        { "target": "msi", "arch": ["x64"] }
       ],
+      "icon": "build/icon.ico",
       "signAndEditExecutable": false
     },
     "portable": {
       "artifactName": "Klar-${version}-portable.exe"
+    },
+    "msi": {
+      "oneClick": false,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "warningsAsErrors": false,
+      "artifactName": "Klar-${version}.msi"
     }
   }
 }

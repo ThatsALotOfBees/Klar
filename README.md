@@ -42,9 +42,15 @@ The web build is the same code; the desktop app just wraps it in a frameless Ele
 ```bash
 npm install                # one-time, installs Electron + electron-builder
 npm run app                # launches Klar from source as a desktop app
-npm run dist               # builds dist/Klar-<version>-portable.exe (~70 MB)
+npm run dist               # builds dist/Klar-<version>-portable.exe AND .msi
 npm run release-client     # snapshot public/ into client-releases/<version>/
 ```
+
+`npm run dist` produces two installers under `dist/`:
+- `Klar-<version>-portable.exe` — single self-extracting executable, no installation. Double-click to run.
+- `Klar-<version>.msi` — Windows Installer. Double-click runs the install wizard; per-user install (no admin required); creates Start Menu + uninstall entries.
+
+Both are equivalent in functionality. The MSI is more familiar to enterprise installs / IT-managed PCs; the portable EXE is friendlier for one-off testing on someone else's machine.
 
 From the dev shell, `app`, `dist`, and `release-client` map to the same scripts.
 
@@ -713,6 +719,39 @@ The renderer was doing exactly what it was told: every message had the same `sen
 - **Real-server URL.** `client-config.json` still has `serverUrl: "http://localhost:3000"`. Once you have a publicly-reachable host (a domain, a tunnel, a VPS), update it and run `npm run release-client && npm run dist` again — that pushes the new URL to all installed EXEs via auto-update *and* produces a freshly-baked EXE for new installs.
 - **GitHub Releases for the EXE.** Right now the auto-update mechanism only updates client files. The EXE itself is committed nowhere automatic — for the user to download the latest, you'd manually upload `dist/Klar-0.1.1-portable.exe` as a release asset. `gh release create v0.1.1 dist/Klar-0.1.1-portable.exe` once you have the EXE built.
 - **Connectivity heartbeat.** Right now we only probe once at boot. If the server goes down mid-session the user sees individual request errors. A tiny WS-driven heartbeat that flips to the error screen on disconnect (with auto-reconnect) would close that gap.
+
+### 2026-05-07 — MSI installer + 0.1.2 release
+**Goal:** User asked for an MSI installer for the desktop app so they can test the cross-internet flow by installing Klar on a remote PC.
+
+**Changes:**
+- `package.json` — added `{ "target": "msi", "arch": ["x64"] }` alongside the existing portable target. New `msi` config block: `oneClick: false` (full install wizard so the user can pick install dir), `perMachine: false` (per-user install, no admin elevation needed), `runAfterFinish: true`, `artifactName: "Klar-${version}.msi"`. Bumped version 0.1.1 → 0.1.2.
+- `client-releases/0.1.2/` — new snapshot (5 files, fresh sha256s). `client-releases/manifest.json` now points at 0.1.2. Pushed installs running 0.1.1 will pick this up via auto-update on next poll.
+- `dist/Klar-0.1.2.msi` — produced by electron-builder. WiX Toolset binaries got pulled into electron-builder's cache the first time.
+
+**Decisions:**
+- **Per-user install** (`perMachine: false`) instead of system-wide. No UAC prompt, works on locked-down PCs, and matches how most chat apps install (Discord, Slack are both per-user by default). Trade-off: each user on a shared machine gets their own install. Acceptable.
+- **Wizard mode** (`oneClick: false`) so testers can see the install path and pick a different drive if needed. `oneClick: true` would silent-install with no UI at all — too magical for a first-time installer.
+- **Both portable EXE and MSI ship together** from one `npm run dist`. Don't have to choose one — testers who don't want a real install can still use the portable.
+- **MSI inherits the same `client-config.json`** as the portable EXE — so both installers point at the same `serverUrl` and `updateRepo`. To test cross-internet you still need the `serverUrl` in that config to be a publicly-reachable URL **before** running `npm run dist`. The MSI's bundled config is locked at build time; auto-update can rewrite it per-install via `userData/client-config.json`, but installs need *some* working `serverUrl` to do the first auto-update poll.
+
+**Two snags I had to fix mid-build:**
+1. `desktop/build.cjs` was defaulting to `--win portable` when called with no args, which **overrode** the new `build.win.target` array in `package.json` and caused the MSI target to be silently skipped. Changed the default to plain `--win` so electron-builder honors the configured target list.
+2. WiX failed with `LGHT0094: identifier 'Icon:KlarIcon.exe' could not be found`. electron-builder's MSI WXS template references the app icon for the desktop / start-menu shortcuts, but no `build/icon.ico` existed. Wrote `scripts/make-icon.cjs` that programmatically generates a 5-size ICO (32, 48, 64, 128, 256) of a plasma-purple orb with a few crater spots — pure Node, no graphics tools, no checked-in binary asset. Added `build.win.icon: "build/icon.ico"` to package.json. Also added `"author": "ThatsALotOfBees"` so MSI gets a proper Manufacturer field.
+
+**Cross-internet testing checklist** (added to "Open / next" because it's user-side work):
+1. Make your local server reachable on the public internet. Cheapest: `cloudflared tunnel --url http://localhost:3000` (free, gives a `*.trycloudflare.com` URL). Alternatives: `ngrok`, port-forwarded home server with a domain, or a small VPS.
+2. Edit `client-config.json`: set `serverUrl` to that public URL.
+3. `npm run dist` again to bake the new URL into the installers.
+4. Hand the resulting `dist/Klar-<v>.msi` (or portable EXE) to a friend on a different network. Install it, log in. Messages should round-trip back to your machine.
+
+**Verification:**
+- `npm run release-client` produced `client-releases/0.1.2/` cleanly. Manifest now reports `version: "0.1.2"`.
+- `npm run dist` build status — see commit message; expected outputs `dist/Klar-0.1.2-portable.exe` and `dist/Klar-0.1.2.msi` both present after a successful run.
+
+**Open / next:**
+- **Server URL.** `client-config.json` still has `serverUrl: "http://localhost:3000"`. The MSI/EXE will install fine, run, and immediately render the broken-cable error screen on the remote PC. To make actual chat work end-to-end, follow the cross-internet checklist above.
+- **MSI app icon.** Like the portable EXE, the MSI ships with the default Electron icon. Adding `build/icon.ico` and re-enabling `signAndEditExecutable: true` (after dealing with WiX symlink permissions) would brand it.
+- **GitHub Release for the MSI.** `gh release create v0.1.2 dist/Klar-0.1.2.msi dist/Klar-0.1.2-portable.exe` once both artifacts exist; the user can then send a release URL instead of an EXE/MSI file.
 
 ## Roadmap (post-MVP)
 

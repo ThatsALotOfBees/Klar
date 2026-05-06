@@ -19,8 +19,10 @@ const builderBin = path.join(
 );
 
 const args = process.argv.slice(2);
-// Default to a Windows portable build if no args were given.
-if (args.length === 0) args.push('--win', 'portable');
+// Default to "build for Windows with whatever targets are configured in
+// package.json's build.win.target". Specifying explicit targets here would
+// OVERRIDE that config, so we just pass `--win` with no target list.
+if (args.length === 0) args.push('--win');
 
 const child = spawn(builderBin, args, {
   stdio: 'inherit',
