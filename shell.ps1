@@ -276,11 +276,28 @@ function Invoke-KlarTunnel {
     [CmdletBinding()]
     param(
         [string]$Subdomain = '',
+        [switch]$Random,
         [switch]$NoStart
     )
     if (-not (Test-Path (Join-Path $KlarRoot 'node_modules\localtunnel'))) {
         Write-Host "localtunnel not installed. Run 'setup' first." -ForegroundColor Yellow
         return
+    }
+
+    # Resolve the subdomain. Priority:
+    #   1. Explicit -Subdomain parameter
+    #   2. -Random switch (force a random one)
+    #   3. tunnelSubdomain field from client-config.json (the stable URL
+    #      that's baked into the distributed EXE/MSI)
+    #   4. Random (localtunnel default)
+    if (-not $Subdomain -and -not $Random) {
+        $cfgPath = Join-Path $KlarRoot 'client-config.json'
+        if (Test-Path $cfgPath) {
+            try {
+                $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+                if ($cfg.tunnelSubdomain) { $Subdomain = $cfg.tunnelSubdomain }
+            } catch {}
+        }
     }
 
     # Make sure the local server is up before opening the tunnel — otherwise
@@ -302,20 +319,16 @@ function Invoke-KlarTunnel {
 
     Write-Host ""
     Write-Host "  ============================================================" -ForegroundColor DarkGray
-    Write-Host "  Opening public tunnel to localhost:$($Global:KlarPort)..." -ForegroundColor Cyan
-    Write-Host "  Anyone with the printed URL can reach your local server." -ForegroundColor DarkGray
+    if ($Subdomain) {
+        Write-Host "  Klar is going public on the stable URL:" -ForegroundColor Cyan
+        Write-Host "    https://$Subdomain.loca.lt" -ForegroundColor Green
+        Write-Host "  Friends running the distributed EXE/MSI will reach it" -ForegroundColor DarkGray
+        Write-Host "  automatically — no env vars, no config on their side." -ForegroundColor DarkGray
+    } else {
+        Write-Host "  Opening tunnel to localhost:$($Global:KlarPort) (random URL)..." -ForegroundColor Cyan
+    }
     Write-Host "  Ctrl+C to close the tunnel; the local server keeps running." -ForegroundColor DarkGray
     Write-Host "  ============================================================" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  Tester instructions (copy-paste this for them):" -ForegroundColor Yellow
-    Write-Host "    1. Install Klar from your dist\Klar-<v>.msi" -ForegroundColor Gray
-    Write-Host "    2. Open cmd.exe and run:" -ForegroundColor Gray
-    Write-Host "         set KLAR_SERVER_URL=<URL printed below>" -ForegroundColor Gray
-    Write-Host "         start " -NoNewline -ForegroundColor Gray
-    Write-Host '"' -NoNewline -ForegroundColor Gray
-    Write-Host '"' -NoNewline -ForegroundColor Gray
-    Write-Host " " -NoNewline -ForegroundColor Gray
-    Write-Host '"%LOCALAPPDATA%\Programs\Klar\Klar.exe"' -ForegroundColor Gray
     Write-Host ""
 
     $ltJs = Join-Path $KlarRoot 'node_modules\localtunnel\bin\lt.js'

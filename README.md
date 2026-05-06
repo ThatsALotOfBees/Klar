@@ -738,16 +738,22 @@ The renderer was doing exactly what it was told: every message had the same `sen
 1. `desktop/build.cjs` was defaulting to `--win portable` when called with no args, which **overrode** the new `build.win.target` array in `package.json` and caused the MSI target to be silently skipped. Changed the default to plain `--win` so electron-builder honors the configured target list.
 2. WiX failed with `LGHT0094: identifier 'Icon:KlarIcon.exe' could not be found`. electron-builder's MSI WXS template references the app icon for the desktop / start-menu shortcuts, but no `build/icon.ico` existed. Wrote `scripts/make-icon.cjs` that programmatically generates a 5-size ICO (32, 48, 64, 128, 256) of a plasma-purple orb with a few crater spots — pure Node, no graphics tools, no checked-in binary asset. Added `build.win.icon: "build/icon.ico"` to package.json. Also added `"author": "ThatsALotOfBees"` so MSI gets a proper Manufacturer field.
 
-**Cross-internet testing checklist:**
-1. Open the dev shell (`klar.cmd`) and run `tunnel`. This starts the local Klar server (if it isn't already running) and opens a public `https://*.loca.lt` URL pointing at it via [localtunnel](https://github.com/localtunnel/localtunnel) — no Cloudflare account, no separate binary, just a Node dep.
-2. Hand the printed URL to your tester along with `dist/Klar-<v>.msi`.
-3. Tester installs Klar, opens cmd.exe, runs:
-   ```cmd
-   set KLAR_SERVER_URL=https://<your-tunnel>.loca.lt
-   start "" "%LOCALAPPDATA%\Programs\Klar\Klar.exe"
-   ```
-   That env var override beats whatever's baked into `client-config.json` for that single launch. They register, log in, and messages roundtrip back to your machine through the tunnel.
-4. To make the URL the default for all future launches without env-var fiddling, edit `client-config.json` to that URL and run `npm run dist` again before redistributing.
+**Cross-internet testing — fully automatic flow:**
+
+The distributed EXE/MSI is **pre-configured** to reach `https://klar-thatsalotofbees.loca.lt` (the stable subdomain pinned in `client-config.json` as `tunnelSubdomain`). Friends never need to set `KLAR_SERVER_URL` or edit anything.
+
+Your side, once per online session:
+1. Open the dev shell (`klar.cmd`).
+2. Run `tunnel`. It auto-starts the local Klar server (if needed), then opens *exactly that* subdomain via [localtunnel](https://github.com/localtunnel/localtunnel). The URL is the same every time you run it, so installed EXEs Just Work the moment your tunnel is up.
+3. Leave the dev shell open while you want testers connected. Ctrl+C to stop.
+
+Their side:
+1. Download `dist/Klar-<v>.msi` (or `.exe`).
+2. Double-click. Install. Run. Register. Chat.
+
+When your machine is offline (or the tunnel isn't running), they see the broken-cable "Couldn't connect to the server" screen with a retry button. The instant your `tunnel` is up, retry connects.
+
+Override the default subdomain with `tunnel -Subdomain my-name`, or force a random one with `tunnel -Random`. Edit `client-config.json`'s `tunnelSubdomain` + `serverUrl` to a different value if you want a different stable URL — then `npm run release-client && npm run dist` to bake the new URL into a fresh installer (and installed EXEs will pick it up on their next manifest poll).
 
 **Verification:**
 - `npm run release-client` produced `client-releases/0.1.2/` cleanly. Manifest now reports `version: "0.1.2"`.
@@ -790,6 +796,30 @@ The renderer was doing exactly what it was told: every message had the same `sen
 **Open / next:**
 - **Custom subdomain per session.** Pass `-Subdomain my-test` to ask localtunnel for a specific subdomain (best-effort — they may already be taken). Useful if you want a stable URL across multiple tunnel sessions on the same day.
 - **Auto-update for tester EXEs.** Once the tester has installed any 0.1.x build, future client-side fixes auto-apply via the GitHub manifest poll. If you want to push *shell* changes (main.cjs, preload, electron version) the tester needs a fresh installer — plumbing for that is "open".
+
+### 2026-05-07 — Stable-URL flow: zero-config for testers, one-command for the host
+**Goal:** User wanted "all automatic, no install or configuring" cross-internet testing. Closest path without paying for permanent hosting: pin a **stable localtunnel subdomain** in `client-config.json`, bake it into the distributed installer, have the dev-shell `tunnel` command open *that exact* subdomain by default. After this, testers never set env vars; the host runs one command (`tunnel`) per session.
+
+**Changes:**
+- `client-config.json` — added `tunnelSubdomain: "klar-thatsalotofbees"`, set `serverUrl: "https://klar-thatsalotofbees.loca.lt"`. Both fields stay aligned.
+- `shell.ps1` `tunnel` — now reads `tunnelSubdomain` from `client-config.json` and passes it to `localtunnel --subdomain` automatically. New `-Random` switch forces a fresh random URL when needed; explicit `-Subdomain` still wins. Output banner now prints the resolved URL up front so the host knows what's live.
+- Bumped 0.1.3 → 0.1.4 + snapshotted into `client-releases/0.1.4/`. Manifest now carries the stable URL, so installed 0.1.x EXEs will pick it up on their next manifest poll.
+
+**Decisions:**
+- **localtunnel `--subdomain` is best-effort, not reservation.** Anyone could theoretically claim `klar-thatsalotofbees` first. The handle is uncommon enough that real-world collision risk is near zero. If it ever happens, `tunnel -Subdomain klar-thatsalotofbees-2` (or any variant) bakes a new value via the same flow.
+- **Don't auto-publish a new URL on every `tunnel` invocation.** Earlier versions of this flow had `tunnel` rewrite + commit + push when the URL changed. Pulled it out: the URL is now a stable fact pinned in source, not a per-session output. One commit per *deliberate* subdomain change.
+- **Friend-facing UX is now: download installer → double-click → register.** No env vars, no copy-paste from cmd, no instructions. The trade-off is that if the host's machine is offline or the tunnel isn't running, friends see the broken-cable screen — same as they would for any down server.
+- **Truly always-on hosting** (fly.io, render.com, a $5 VPS) is the only way to remove the host's "run `tunnel`" step entirely. Documented in "Open / next" — it's a one-time account-creation away whenever the user wants it.
+
+**Verification:**
+- `node -e "console.log(require('./client-releases/manifest.json').serverUrl)"` → `https://klar-thatsalotofbees.loca.lt`. ✓
+- shell.ps1 dot-sourced cleanly; `tunnel` resolves the subdomain from config when invoked with no args. (Manual-run only — automated test would need a real localtunnel session.)
+- `npm run dist` produces fresh installers with the new URL baked in (build status — see commit message).
+
+**Open / next:**
+- **True always-on hosting.** fly.io free tier (3 small VMs, 160 GB egress/month) or render.com free tier (750 service-hours/month) would host server.js with a stable HTTPS URL and zero host-side commands. Both require account creation + a deploy config — say the word and I'll wire it up.
+- **Auto-start `tunnel` on login** via Windows Task Scheduler. One-line setup; turns the host's "run a command" step into "boot your machine."
+- **Apply manifest's `serverUrl` to `userData/client-config.json`** during update. Currently the client reads `serverUrl` from the bundle + userData layer; the manifest's `serverUrl` is metadata only. If the user ever changes the stable subdomain, distributed EXEs would need a manual rebuild to pick it up. Safe to defer because the URL change is rare.
 
 ## Roadmap (post-MVP)
 

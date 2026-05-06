@@ -1,7 +1,9 @@
 {
   "_comment": "Klar client configuration. Edit before building (`npm run dist`) so the produced EXE points at your server and your update repo. This file is bundled into the EXE; runtime overrides are stored under userData/client-config.json after auto-update.",
 
-  "serverUrl": "http://localhost:3000",
+  "_serverUrlNote": "Stable URL pinned to localtunnel subdomain `tunnelSubdomain` below. The dev-shell `tunnel` command opens that exact subdomain so installed EXEs always know where to find the server. Friends never need to set KLAR_SERVER_URL.",
+  "serverUrl": "https://klar-thatsalotofbees.loca.lt",
+  "tunnelSubdomain": "klar-thatsalotofbees",
 
   "updateRepo": "ThatsALotOfBees/Klar",
   "updateBranch": "main",
