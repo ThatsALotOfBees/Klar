@@ -1,472 +1,156 @@
-// Klar desktop shell (Electron main process, CommonJS).
+// Klar bootstrap (the MSI's actual entry point per package.json "main").
 //
-// Two operating modes:
+// On launch, this thin shim:
+//   1. Tries to fetch the freshest desktop/host.cjs + desktop/updater.cjs
+//      + desktop/preload.cjs from the configured GitHub repo, writing
+//      them under userData/host/. Best-effort — silently continues if
+//      offline / GitHub is down.
+//   2. Loads userData/host/host.cjs if present (the just-downloaded or
+//      previously-cached version), else falls back to the bundled
+//      desktop/host.cjs that shipped inside the MSI.
+//   3. Calls host.start() to actually boot the app.
 //
-//  1. DEV (npm run app, app.isPackaged === false): spawn the local
-//     server.js as a child of the user's system Node and point the
-//     BrowserWindow at http://localhost:<port>. Same behavior as before.
+// Result: the MSI is "universal" — feature changes in main-process code
+// land via the same GitHub-driven path as renderer changes. The MSI
+// itself only needs to be rebuilt when this bootstrap changes (rare).
 //
-//  2. PACKAGED (the EXE produced by `npm run dist`): the backend lives on
-//     the user's own server somewhere on the internet. The Electron shell
-//     does NOT spawn a server. It loads the client files from
-//     userData/client/ (auto-updated from a GitHub repo) and the renderer
-//     talks to the configured KLAR_CONFIG.serverUrl over HTTPS / WSS.
+// Failure modes:
+//   - No internet on first ever launch: falls back to bundled host.
+//   - Corrupt downloaded host.cjs: caught, falls back to bundled.
+//   - Bundled host.cjs missing or broken: app.quit() with a log.
 
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, session, desktopCapturer } = require('electron');
+const { app } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
-const { spawn } = require('node:child_process');
-const updater = require('./updater.cjs');
+const https = require('node:https');
 
-// Tray / minimize-to-tray. Defaults to enabled; renderer can toggle via IPC
-// (Settings → Advanced → "Minimize to tray on close"). When enabled, the
-// window's 'close' event hides the window instead of quitting; the user has
-// to explicitly choose Quit from the tray menu.
-let _tray = null;
-let _minimizeToTray = true;
-let _quittingForReal = false;
+const BUNDLED_HOST_PATH    = path.join(__dirname, 'host.cjs');
+const BUNDLED_PRELOAD_PATH = path.join(__dirname, 'preload.cjs');
+const BUNDLED_UPDATER_PATH = path.join(__dirname, 'updater.cjs');
 
-// ---------- Per-session log file ----------
-//
-// The renderer pipes log lines here over IPC. We append them to a fresh
-// file under <userData>/Klar/logs/<ts>.log for the lifetime of this Electron
-// window, plus mirror to the main-process stdout (which the dev shell can
-// capture via `npm run app`). Main-process events (boot, shutdown, IPC
-// handlers themselves) are also written so the file is a complete
-// per-session record.
+// Files we try to keep fresh from GitHub on each launch. The require
+// graph for host.cjs needs updater.cjs in the same dir, hence both.
+// preload.cjs is also colocated because host.cjs's createWindow uses
+// `path.join(__dirname, 'preload.cjs')`.
+const HOST_FILES = ['host.cjs', 'updater.cjs', 'preload.cjs'];
 
-let _sessionLogStream = null;
-let _sessionLogPath = null;
+function userDataDir() { return app.getPath('userData'); }
+function liveHostDir() { return path.join(userDataDir(), 'host'); }
+function liveHostPath() { return path.join(liveHostDir(), 'host.cjs'); }
 
-function ensureSessionLog() {
-  if (_sessionLogPath) return;
-  try {
-    const dir = path.join(app.getPath('userData'), 'logs');
-    fs.mkdirSync(dir, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    _sessionLogPath = path.join(dir, `${stamp}.log`);
-    // No createWriteStream — sessionLog() writes synchronously via
-    // appendFileSync now (see comment there). Stream-buffered logs were
-    // getting lost on hard exits.
-    sessionLog('INFO', 'session.start', `Klar session ${stamp}`, {
-      pid: process.pid, electron: process.versions.electron, chrome: process.versions.chrome,
-      platform: process.platform, arch: process.arch, logFile: _sessionLogPath,
-    });
-    // Best-effort housekeeping — keep the 50 newest log files.
-    try {
-      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
-      files.sort();
-      if (files.length > 50) {
-        for (const f of files.slice(0, files.length - 50)) {
-          try { fs.unlinkSync(path.join(dir, f)); } catch {}
-        }
-      }
-    } catch {}
-  } catch (e) {
-    console.error('[klar] failed to open session log:', e.message);
-  }
-}
-
-function sessionLog(level, category, message, extra) {
-  const ts = new Date().toISOString();
-  let line = `[${ts}] ${String(level).padEnd(5)} ${String(category || '').padEnd(22)} ${message || ''}`;
-  if (extra && typeof extra === 'object') {
-    const parts = [];
-    for (const k of Object.keys(extra)) {
-      const v = extra[k];
-      if (v === undefined || v === null) continue;
-      const s = typeof v === 'string' ? v : JSON.stringify(v);
-      parts.push(`${k}=${s}`);
-    }
-    if (parts.length) line += (message ? ' ' : '') + parts.join(' ');
-  }
-  // Synchronous append so logs always land on disk even if the process is
-  // killed without graceful shutdown (X-button close, Task Manager kill,
-  // crash). The previous WriteStream implementation buffered up to 16 KB
-  // before flushing, which meant short sessions wrote nothing visible —
-  // exactly the bug we hit when trying to debug "stuck on connecting".
-  if (_sessionLogPath) {
-    try { fs.appendFileSync(_sessionLogPath, line + '\n'); } catch {}
-  }
-  // Also surface to main-process stdout for `npm run app` users.
-  process.stdout.write(line + '\n');
-}
-
-function closeSessionLog() {
-  if (!_sessionLogPath) return;
-  sessionLog('INFO', 'session.end', 'closing log');
-  if (_sessionLogStream) { try { _sessionLogStream.end(); } catch {} _sessionLogStream = null; }
-  _sessionLogPath = null;
-}
-
-let mainWindow = null;
-let serverProc = null;
-let runtimeConfig = null; // resolved KLAR_CONFIG (server URL etc.) for this run
-
-// ---------- Path resolution ----------
-
-function findFile(candidates) {
-  for (const c of candidates) if (c && fs.existsSync(c)) return c;
-  throw new Error(`not found in any of: ${candidates.filter(Boolean).join(', ')}`);
-}
-
-function findServerJs() {
-  return findFile([
-    path.join(__dirname, '..', 'server.js'),
-    process.resourcesPath ? path.join(process.resourcesPath, 'app', 'server.js') : null,
-  ]);
-}
-function findBundledClientDir() {
-  return findFile([
-    path.join(__dirname, '..', 'public'),
-    process.resourcesPath ? path.join(process.resourcesPath, 'app', 'public') : null,
-  ]);
-}
-function findBundledConfigPath() {
-  return findFile([
+function readBundledConfig() {
+  // We can't use desktop/host.cjs's readConfig() because that's part of
+  // what we're trying to load — and we need the updateRepo/branch BEFORE
+  // we decide where to fetch from.
+  const candidates = [
     path.join(__dirname, '..', 'client-config.json'),
     process.resourcesPath ? path.join(process.resourcesPath, 'app', 'client-config.json') : null,
-  ]);
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { return JSON.parse(fs.readFileSync(c, 'utf8')); } catch {}
+  }
+  return {};
 }
 
-// ---------- Config ----------
-
-function readConfig() {
-  let bundled = {};
-  try { bundled = JSON.parse(fs.readFileSync(findBundledConfigPath(), 'utf8')); }
-  catch (e) { console.error('failed to read bundled client-config.json:', e.message); }
-
-  // Runtime override: userData/client-config.json (rarely used; reserved for
-  // changing serverUrl post-install without rebuilding).
-  let override = {};
-  try {
-    const p = path.join(app.getPath('userData'), 'client-config.json');
-    if (fs.existsSync(p)) override = JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch (e) { console.error('failed to read userData/client-config.json:', e.message); }
-
-  const merged = { ...bundled, ...override };
-  // Env vars beat all (lets developers point a packaged build at staging).
-  if (process.env.KLAR_SERVER_URL) merged.serverUrl = process.env.KLAR_SERVER_URL;
-  if (process.env.KLAR_UPDATE_REPO) merged.updateRepo = process.env.KLAR_UPDATE_REPO;
-  // Bundled version comes from package.json — read it once.
-  try {
-    const pkgPath = findFile([
-      path.join(__dirname, '..', 'package.json'),
-      process.resourcesPath ? path.join(process.resourcesPath, 'app', 'package.json') : null,
-    ]);
-    merged.version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || '0.0.0';
-  } catch {}
-  return merged;
-}
-
-// ---------- Dev: spawn local server ----------
-
-function startLocalServer() {
+function fetchText(url, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const serverPath = findServerJs();
-    const projectRoot = path.dirname(serverPath);
-    const PORT = process.env.PORT || '3000';
-    const node = process.platform === 'win32' ? 'node.exe' : 'node';
-    serverProc = spawn(node,
-      ['--disable-warning=ExperimentalWarning', serverPath],
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, PORT, KLAR_DATA_DIR: projectRoot },
-        cwd: projectRoot,
-        windowsHide: true,
-      });
-    let stderrBuf = '';
-    let resolved = false;
-    serverProc.stdout.on('data', (d) => {
-      const s = d.toString();
-      process.stdout.write(`[klar-server] ${s}`);
-      if (!resolved && /running at http:\/\/localhost:(\d+)/.test(s)) {
-        resolved = true;
-        resolve(`http://localhost:${s.match(/running at http:\/\/localhost:(\d+)/)[1]}`);
-      }
-    });
-    serverProc.stderr.on('data', (d) => {
-      stderrBuf += d.toString();
-      process.stderr.write(`[klar-server] ${d}`);
-    });
-    serverProc.on('exit', (code) => {
-      console.error(`[klar-server] exited (code=${code})`);
-      if (!resolved) reject(new Error(`server failed to start: ${stderrBuf || `exit ${code}`}`));
-      if (resolved && !app.isQuiting) app.quit();
-    });
-    serverProc.on('error', (err) => {
-      if (!resolved) reject(new Error(`failed to spawn '${node}': ${err.message}`));
-    });
-  });
-}
-
-// ---------- Window ----------
-
-async function createWindow() {
-  const userDataDir = app.getPath('userData');
-  const bundledClientDir = findBundledClientDir();
-
-  // Resolve target URL/file + window config BEFORE creating the BrowserWindow,
-  // so additionalArguments carry the correct serverUrl on the first paint.
-  let configForWindow;
-  let loadAction; // (win) => Promise
-
-  if (app.isPackaged) {
-    await updater.init({
-      window: null, // set below after the window is created
-      config: runtimeConfig,
-      paths: { userData: userDataDir, bundledClient: bundledClientDir },
-    });
-    configForWindow = {
-      serverUrl: runtimeConfig.serverUrl || '',
-      version: runtimeConfig.version || '0.0.0',
-      updateRepo: runtimeConfig.updateRepo || null,
-    };
-    const indexPath = path.join(userDataDir, 'client', 'index.html');
-    loadAction = (win) => win.loadFile(indexPath);
-  } else {
-    const url = await startLocalServer();
-    runtimeConfig.serverUrl = url;
-    configForWindow = { serverUrl: url, version: runtimeConfig.version || 'dev', updateRepo: null };
-    loadAction = (win) => win.loadURL(url);
-  }
-
-  mainWindow = new BrowserWindow({
-    width: 1280, height: 800, minWidth: 880, minHeight: 540,
-    backgroundColor: '#06040c', show: false,
-    frame: false, titleBarStyle: 'hidden', autoHideMenuBar: true,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
-      contextIsolation: true, nodeIntegration: false, sandbox: true,
-      additionalArguments: ['--klar-config=' + encodeURIComponent(JSON.stringify(configForWindow))],
-    },
-  });
-
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.on('maximize',   () => pushMaxState());
-  mainWindow.on('unmaximize', () => pushMaxState());
-  // Stop flashing the taskbar once the user looks at the window again.
-  mainWindow.on('focus', () => { try { mainWindow.flashFrame(false); } catch {} });
-
-  // Minimize-to-tray: when the user closes the window we hide it instead of
-  // quitting, so DM notifications keep arriving in the background. The user
-  // explicitly chooses Quit from the tray menu (or sets the toggle off in
-  // Settings → Advanced).
-  mainWindow.on('close', (e) => {
-    if (_minimizeToTray && !_quittingForReal && !app.isQuiting) {
-      e.preventDefault();
-      mainWindow.hide();
-    }
-  });
-
-  if (app.isPackaged) updater.setWindow(mainWindow);
-
-  await loadAction(mainWindow);
-  ensureTray();
-}
-
-function ensureTray() {
-  if (_tray) return;
-  // Find an icon. In dev we can fall back to the build/icon.ico shipped in
-  // the repo. In packaged builds it's bundled by electron-builder.
-  let iconPath = path.join(__dirname, '..', 'build', 'icon.ico');
-  if (app.isPackaged) {
-    const packaged = path.join(process.resourcesPath, 'build', 'icon.ico');
-    if (fs.existsSync(packaged)) iconPath = packaged;
-  }
-  let img = nativeImage.createFromPath(iconPath);
-  if (img.isEmpty()) {
-    // Tiny 16x16 transparent placeholder so Tray() doesn't throw.
-    img = nativeImage.createEmpty();
-  }
-  try {
-    _tray = new Tray(img);
-    _tray.setToolTip('Klar');
-    _tray.setContextMenu(Menu.buildFromTemplate([
-      { label: 'Show Klar', click: () => showWindow() },
-      { type: 'separator' },
-      { label: 'Quit',      click: () => { _quittingForReal = true; app.isQuiting = true; app.quit(); } },
-    ]));
-    _tray.on('click', () => showWindow());
-  } catch (e) {
-    sessionLog('WARN', 'tray.init', 'tray creation failed', { err: e.message });
-  }
-}
-
-function showWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  if (!mainWindow.isVisible()) mainWindow.show();
-  try { mainWindow.focus(); } catch {}
-}
-
-function pushMaxState() {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('klar:max-state', mainWindow.isMaximized());
-  }
-}
-
-// ---------- IPC ----------
-
-ipcMain.handle('klar:close',           () => { if (mainWindow) mainWindow.close(); });
-ipcMain.handle('klar:minimize',        () => { if (mainWindow) mainWindow.minimize(); });
-ipcMain.handle('klar:toggle-maximize', () => {
-  if (!mainWindow) return false;
-  if (mainWindow.isMaximized()) { mainWindow.unmaximize(); return false; }
-  mainWindow.maximize();
-  return true;
-});
-ipcMain.handle('klar:is-maximized',    () => mainWindow ? mainWindow.isMaximized() : false);
-
-// Renderer-side log lines pipe in here.
-ipcMain.on('klar:log', (_e, level, category, message, extra) => {
-  sessionLog(level || 'INFO', category, message, extra);
-});
-
-ipcMain.handle('klar:check-now', async () => updater.checkOnce());
-
-// Screen-share custom picker — desktopCapturer.getSources gives us all
-// screens + windows + thumbnails. The renderer renders the picker UI;
-// here we just supply the data. Returning the mediaSourceId lets the
-// renderer call getUserMedia with chromeMediaSource:'desktop' +
-// chromeMediaSourceId:<id> directly, bypassing the (sometimes flaky)
-// OS-level display-media picker entirely.
-ipcMain.handle('klar:screen-sources', async () => {
-  try {
-    const sources = await desktopCapturer.getSources({
-      types: ['screen', 'window'],
-      thumbnailSize: { width: 320, height: 180 },
-      fetchWindowIcons: false,
-    });
-    return sources
-      .filter((s) => s.thumbnail && !s.thumbnail.isEmpty())
-      .map((s) => ({
-        id: s.id,
-        name: s.name || (s.id.startsWith('screen:') ? 'Screen' : 'Window'),
-        kind: s.id.startsWith('screen:') ? 'screen' : 'window',
-        // Data URL of the thumbnail. Small enough to ship over IPC.
-        thumbnail: s.thumbnail.toDataURL(),
-      }));
-  } catch (e) {
-    sessionLog('WARN', 'screen.sources', 'failed', { err: e.message });
-    return [];
-  }
-});
-ipcMain.handle('klar:show', () => { showWindow(); return true; });
-ipcMain.handle('klar:flash', () => {
-  // Flash the taskbar icon to draw attention. Auto-clears on next focus.
-  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFocused()) {
-    try { mainWindow.flashFrame(true); } catch {}
-  }
-  return true;
-});
-ipcMain.handle('klar:set-minimize-to-tray', (_e, on) => {
-  _minimizeToTray = !!on;
-  return _minimizeToTray;
-});
-ipcMain.handle('klar:get-minimize-to-tray', () => _minimizeToTray);
-ipcMain.handle('klar:log-dir', () => _sessionLogPath ? path.dirname(_sessionLogPath) : null);
-ipcMain.handle('klar:log-open-dir', () => {
-  if (!_sessionLogPath) return false;
-  try { shell.openPath(path.dirname(_sessionLogPath)); return true; } catch { return false; }
-});
-ipcMain.handle('klar:apply-update', async () => {
-  const ok = await updater.applyPending();
-  if (ok && mainWindow && !mainWindow.isDestroyed()) {
-    const indexPath = path.join(app.getPath('userData'), 'client', 'index.html');
-    await mainWindow.loadFile(indexPath);
-  }
-  return ok;
-});
-
-// ---------- Lifecycle ----------
-
-app.on('window-all-closed', () => {
-  // With minimize-to-tray on (default) we keep the app alive in the tray
-  // even if every window has closed; the user has to choose Quit from
-  // the tray menu. macOS already follows this convention by default.
-  if (process.platform !== 'darwin' && !_minimizeToTray) app.quit();
-});
-app.on('activate', () => { if (mainWindow) showWindow(); });
-app.on('before-quit', () => {
-  app.isQuiting = true;
-  updater.dispose();
-  if (serverProc && !serverProc.killed) {
-    try { serverProc.kill(); } catch {}
-  }
-  closeSessionLog();
-});
-
-// Auto-grant media + screen-capture permissions for our renderer. Without
-// this, getUserMedia silently fails in Electron (no popup, no error
-// surfaced to the renderer) — which is what was causing the empty mic /
-// headphone dropdowns and the "stuck on connecting" calls (no audio
-// track to add to the peer connection). We're a single-purpose app, so
-// auto-allow is the right default; users can revoke at the OS level.
-function registerPermissionHandlers(s) {
-  s.setPermissionRequestHandler((webContents, permission, callback) => {
-    const ok = ['media', 'mediaKeySystem', 'display-capture', 'notifications', 'fullscreen'].includes(permission);
-    callback(!!ok);
-  });
-  // Newer Electron uses setPermissionCheckHandler for synchronous checks.
-  if (typeof s.setPermissionCheckHandler === 'function') {
-    s.setPermissionCheckHandler((webContents, permission) => {
-      return ['media', 'mediaKeySystem', 'display-capture', 'notifications', 'fullscreen'].includes(permission);
-    });
-  }
-}
-
-// getDisplayMedia handler — gives the renderer access to the OS screen /
-// window picker for screen sharing during a call. We register the handler
-// with useSystemPicker:true so Windows 10+ shows its native chrome (no
-// custom thumbnail picker UI to maintain). The fallback path (if the OS
-// can't show a system picker) just hands back the first available screen
-// source so getDisplayMedia at least resolves successfully.
-function registerDisplayMediaHandler(s) {
-  try {
-    s.setDisplayMediaRequestHandler(
-      async (_request, callback) => {
-        try {
-          const sources = await desktopCapturer.getSources({
-            types: ['screen', 'window'],
-            thumbnailSize: { width: 0, height: 0 },
-            fetchWindowIcons: false,
-          });
-          if (!sources.length) return callback({});
-          callback({ video: sources[0], audio: 'loopback' });
-        } catch (e) {
-          sessionLog('WARN', 'screenshare.handler', 'fallback failed', { err: e.message });
-          callback({});
-        }
+    const req = https.get(url, {
+      headers: {
+        'User-Agent':    'klar-bootstrap/0.1',
+        'Cache-Control': 'no-cache',
       },
-      { useSystemPicker: true }
-    );
-  } catch (e) {
-    sessionLog('WARN', 'screenshare.handler', 'register failed', { err: e.message });
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error('status ' + res.statusCode));
+        return;
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => data += c);
+      res.on('end',  () => resolve(data));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs || 8000, () => req.destroy(new Error('timeout')));
+  });
+}
+
+async function pullHostUpdate(repo, branch) {
+  if (!repo) return { skipped: 'no updateRepo configured' };
+  fs.mkdirSync(liveHostDir(), { recursive: true });
+  const base = `https://raw.githubusercontent.com/${repo}/${branch || 'main'}/desktop`;
+  const written = [];
+  for (const file of HOST_FILES) {
+    try {
+      const text = await fetchText(`${base}/${file}?t=${Date.now()}`, 8000);
+      // Sanity check — host.cjs MUST export a start() function. If the
+      // download is truncated or otherwise broken, we don't want to
+      // overwrite the cached working copy.
+      if (file === 'host.cjs' && !text.includes('module.exports') && !text.includes('exports.start')) {
+        throw new Error('downloaded host.cjs missing exports');
+      }
+      fs.writeFileSync(path.join(liveHostDir(), file), text, 'utf8');
+      written.push(file);
+    } catch (e) {
+      // Non-fatal. We'll use whatever's already in liveHostDir() or
+      // the bundled copy.
+      console.error('[bootstrap] fetch ' + file + ': ' + e.message);
+    }
   }
+  return { written };
+}
+
+function loadHost() {
+  // Prefer userData live copy (latest from GitHub). Fall back to the
+  // bundled copy if live is missing or unreadable.
+  if (fs.existsSync(liveHostPath())) {
+    try {
+      const live = require(liveHostPath());
+      if (live && typeof live.start === 'function') {
+        console.log('[bootstrap] using live host from ' + liveHostPath());
+        return live;
+      }
+      console.error('[bootstrap] live host has no start() — falling back to bundled');
+    } catch (e) {
+      console.error('[bootstrap] live host failed to load: ' + e.message);
+    }
+  }
+  if (fs.existsSync(BUNDLED_HOST_PATH)) {
+    try {
+      const bundled = require(BUNDLED_HOST_PATH);
+      if (bundled && typeof bundled.start === 'function') {
+        console.log('[bootstrap] using bundled host from ' + BUNDLED_HOST_PATH);
+        return bundled;
+      }
+    } catch (e) {
+      console.error('[bootstrap] bundled host failed to load: ' + e.message);
+    }
+  }
+  return null;
 }
 
 (async () => {
   await app.whenReady();
-  ensureSessionLog();
-  registerPermissionHandlers(session.defaultSession);
-  registerDisplayMediaHandler(session.defaultSession);
-  runtimeConfig = readConfig();
-  sessionLog('INFO', 'app.config', 'resolved', {
-    serverUrl: runtimeConfig.serverUrl,
-    version: runtimeConfig.version,
-    updateRepo: runtimeConfig.updateRepo,
-    isPackaged: app.isPackaged,
-  });
+  const cfg = readBundledConfig();
+  // Best-effort GitHub pull. Don't block app startup on it.
   try {
-    await createWindow();
-    sessionLog('INFO', 'app.window', 'shown');
+    const r = await pullHostUpdate(cfg.updateRepo, cfg.updateBranch || 'main');
+    if (r.written && r.written.length) {
+      console.log('[bootstrap] pulled host files: ' + r.written.join(', '));
+    }
   } catch (e) {
-    sessionLog('ERROR', 'app.startup', 'failed', { err: e.message });
+    console.error('[bootstrap] pullHostUpdate threw: ' + e.message);
+  }
+  const host = loadHost();
+  if (!host) {
+    console.error('[bootstrap] no working host available, quitting');
+    app.quit();
+    return;
+  }
+  try { await host.start(); }
+  catch (e) {
+    console.error('[bootstrap] host.start() threw: ' + (e && e.stack || e));
     app.quit();
   }
-})().catch((e) => {
-  console.error('klar electron startup failed:', e);
-  app.quit();
-});
+})();
