@@ -144,17 +144,24 @@ async function checkOnce() {
   if (semverCmp(latest, installed) <= 0) return { upToDate: true, installed, latest };
   if (!Array.isArray(manifest.files) || !manifest.files.length) return { error: 'manifest has no files' };
 
-  await downloadVersionInto(latest, manifest.files, clientNextDir());
-  pendingVersion = latest;
+  // If we've already downloaded this exact version on a previous poll,
+  // don't waste bandwidth re-downloading every minute. Just re-notify the
+  // renderer so the user keeps seeing the toast even if they dismissed it.
+  const alreadyDownloaded = pendingVersion === latest && fs.existsSync(path.join(clientNextDir(), 'index.html'));
+  if (!alreadyDownloaded) {
+    await downloadVersionInto(latest, manifest.files, clientNextDir());
+    pendingVersion = latest;
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('klar:update-available', {
       from: installed,
       to: latest,
       serverUrl: manifest.serverUrl || cfg.serverUrl,
       notes: manifest.notes || null,
+      alreadyDownloaded,
     });
   }
-  return { downloaded: true, installed, latest };
+  return { downloaded: !alreadyDownloaded, installed, latest };
 }
 
 async function applyPending() {

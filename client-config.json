@@ -8,5 +8,5 @@
   "updateRepo": "ThatsALotOfBees/Klar",
   "updateBranch": "main",
   "updateChannel": "stable",
-  "updateCheckIntervalMs": 3600000
+  "updateCheckIntervalMs": 60000
 }
