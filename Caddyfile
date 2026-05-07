@@ -14,10 +14,13 @@
 #   or in this shell:  caddy-up
 # Bring it down:        caddy-down
 
-# Email is used by Let's Encrypt for cert renewal notifications.
-{
-	email albertinosilva65@gmail.com
-}
+# Let's Encrypt account email goes here. Leave it commented and Caddy will
+# generate certs without an account email (still works; you just don't get
+# expiry warnings). Uncomment + fill in when you have an address you want
+# the renewal alerts to land at.
+# {
+#     email you@example.com
+# }
 
 thatsalotofbees.online, www.thatsalotofbees.online {
 	# Reverse-proxy to the Klar Node server. reverse_proxy upgrades the

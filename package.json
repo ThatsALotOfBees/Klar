@@ -1,8 +1,10 @@
 {
   "name": "klar",
-  "version": "0.1.22",
-  "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
-  "author": "ThatsALotOfBees",
+  "version": "0.1.23",
+  "description": "Klar — voice, video and screen-share chat by Crystalix LLC.",
+  "author": {
+    "name": "Crystalix LLC"
+  },
   "type": "module",
   "main": "desktop/main.cjs",
   "private": true,
@@ -29,6 +31,7 @@
   "build": {
     "appId": "chat.klar.desktop",
     "productName": "Klar",
+    "copyright": "Copyright © 2026 Crystalix LLC",
     "asar": false,
     "files": [
       "desktop/**/*",
@@ -59,7 +62,10 @@
         { "target": "msi", "arch": ["x64"] }
       ],
       "icon": "build/icon.ico",
-      "signAndEditExecutable": false
+      "publisherName": "Crystalix LLC",
+      "legalTrademarks": "Klar - Crystalix LLC",
+      "signAndEditExecutable": true,
+      "forceCodeSigning": false
     },
     "portable": {
       "artifactName": "Klar-${version}-portable.exe"

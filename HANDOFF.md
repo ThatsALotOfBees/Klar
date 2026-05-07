@@ -126,7 +126,7 @@ dist              # build the portable EXE / MSI installer
 | DNS records currently set | A `@` and A `*` → `87.215.222.184` (TLD delegation was still propagating last check — RDAP returned 404) |
 | AAAA records | deleted in mijndomein panel; verify if you go back to path A |
 | GitHub repo | `ThatsALotOfBees/Klar` (public, used for auto-update + server.json discovery) |
-| Email used for Caddy/Let's Encrypt account | albertinosilva65@gmail.com |
+| Email used for Caddy/Let's Encrypt account | (none configured) |
 
 ---
 
