@@ -980,6 +980,27 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   send(res, 200, { message });
 });
 
+// DELETE /api/dms/:dmId/messages/:msgId — only the original sender can
+// delete their own message. We append a delete marker to the .KDB archive
+// (auditable) but don't actually rewrite the day's KDB file. Attachment
+// uploads are kept on disk in case other messages reference the same URL;
+// orphan-cleanup is a separate housekeeping concern.
+route('DELETE', /^\/api\/dms\/([a-f0-9]+)\/messages\/([a-f0-9]+)$/, async (req, res, [, dmId, msgId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const dm = db.prepare('SELECT * FROM dms WHERE id = ?').get(dmId);
+  if (!dm || !userInDm(me, dm)) return sendError(res, 404, 'dm not found');
+  const m = db.prepare('SELECT * FROM messages WHERE id = ? AND dm_id = ?').get(msgId, dmId);
+  if (!m) return sendError(res, 404, 'message not found');
+  if (m.sender_id !== me.id) return sendError(res, 403, 'only the sender can delete a message');
+  db.prepare('DELETE FROM messages WHERE id = ?').run(msgId);
+  log.info('msg.dm.delete', 'deleted', { dm: dmId, msg: msgId, by: me.username });
+  const payload = { type: 'message_deleted', dmId, messageId: msgId };
+  broadcastToUser(dm.user_a, payload);
+  if (dm.user_a !== dm.user_b) broadcastToUser(dm.user_b, payload);
+  send(res, 200, { ok: true });
+});
+
 route('GET', /^\/api\/dms\/([a-f0-9]+)\/archive$/, async (req, res, [, dmId]) => {
   const me = authedUser(req);
   if (!me) return sendError(res, 401, 'not authenticated');
@@ -1196,6 +1217,24 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
 
   broadcastToServer(ch.server_id, { type: 'channel_message', message });
   send(res, 200, { message });
+});
+
+// DELETE /api/channels/:channelId/messages/:msgId — sender can delete
+// their own message; the server owner can delete anyone's message in
+// their server (moderation).
+route('DELETE', /^\/api\/channels\/([a-f0-9]+)\/messages\/([a-f0-9]+)$/, async (req, res, [, channelId, msgId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  if (!ch || !userIsServerMember(me.id, ch.server_id)) return sendError(res, 404, 'channel not found');
+  const m = db.prepare('SELECT * FROM channel_messages WHERE id = ? AND channel_id = ?').get(msgId, channelId);
+  if (!m) return sendError(res, 404, 'message not found');
+  const isOwner = userOwnsServer(me.id, ch.server_id);
+  if (m.sender_id !== me.id && !isOwner) return sendError(res, 403, 'not your message');
+  db.prepare('DELETE FROM channel_messages WHERE id = ?').run(msgId);
+  log.info('msg.channel.delete', 'deleted', { channel: channelId, msg: msgId, by: me.username, asOwner: isOwner && m.sender_id !== me.id });
+  broadcastToServer(ch.server_id, { type: 'channel_message_deleted', channelId, messageId: msgId });
+  send(res, 200, { ok: true });
 });
 
 // ---------------- Invites ----------------

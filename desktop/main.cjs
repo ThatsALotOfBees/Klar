@@ -12,7 +12,7 @@
 //     userData/client/ (auto-updated from a GitHub repo) and the renderer
 //     talks to the configured KLAR_CONFIG.serverUrl over HTTPS / WSS.
 
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, session, desktopCapturer } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
@@ -363,9 +363,40 @@ app.on('before-quit', () => {
   closeSessionLog();
 });
 
+// getDisplayMedia handler — gives the renderer access to the OS screen /
+// window picker for screen sharing during a call. We register the handler
+// with useSystemPicker:true so Windows 10+ shows its native chrome (no
+// custom thumbnail picker UI to maintain). The fallback path (if the OS
+// can't show a system picker) just hands back the first available screen
+// source so getDisplayMedia at least resolves successfully.
+function registerDisplayMediaHandler(s) {
+  try {
+    s.setDisplayMediaRequestHandler(
+      async (_request, callback) => {
+        try {
+          const sources = await desktopCapturer.getSources({
+            types: ['screen', 'window'],
+            thumbnailSize: { width: 0, height: 0 },
+            fetchWindowIcons: false,
+          });
+          if (!sources.length) return callback({});
+          callback({ video: sources[0], audio: 'loopback' });
+        } catch (e) {
+          sessionLog('WARN', 'screenshare.handler', 'fallback failed', { err: e.message });
+          callback({});
+        }
+      },
+      { useSystemPicker: true }
+    );
+  } catch (e) {
+    sessionLog('WARN', 'screenshare.handler', 'register failed', { err: e.message });
+  }
+}
+
 (async () => {
   await app.whenReady();
   ensureSessionLog();
+  registerDisplayMediaHandler(session.defaultSession);
   runtimeConfig = readConfig();
   sessionLog('INFO', 'app.config', 'resolved', {
     serverUrl: runtimeConfig.serverUrl,

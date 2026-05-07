@@ -1,6 +1,6 @@
 {
   "name": "klar",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
   "author": "ThatsALotOfBees",
   "type": "module",

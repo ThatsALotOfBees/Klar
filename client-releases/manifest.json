@@ -1,19 +1,19 @@
 {
-  "version": "0.1.17",
-  "releasedAt": "2026-05-07T14:58:46.652Z",
+  "version": "0.1.18",
+  "releasedAt": "2026-05-07T15:09:58.399Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",
-      "sha256": "5d2472bc1705cb784cb824cafa4c7712a429ec2a9483a840426621a9c529d4ed"
+      "sha256": "19c6d6a57580c352fe79585c7fccbe82583f58fc058de58e516e270bec6da8fb"
     },
     {
       "path": "app.js",
-      "sha256": "b71627aca439eb3c6525fbfd277d9646ec3440481f8b8c0e8f4e199a4fe6089b"
+      "sha256": "ea3770649433e4197161baf76dd154eb1804a58fb6ce47abadb0a8a24e9faf14"
     },
     {
       "path": "index.html",
-      "sha256": "dd6bf783e19724bf907c447b1e6599012da93455af263f9dc28f7542c871fef8"
+      "sha256": "4ecc6f1a7257378ceaa03c47cb5ce40390edededda01b5eb519998ea876f4607"
     },
     {
       "path": "sounds/dialing.mp3",
@@ -25,7 +25,7 @@
     },
     {
       "path": "styles.css",
-      "sha256": "b76aef42c4a4a68963774e1ad30af6cbdbaa01013b82a431cc479a389aac16a1"
+      "sha256": "d62ea8146a657a0ac0eac9cc77bfb4b603a3f0646a879bfffce116a4bdd0c2e8"
     }
   ],
   "notes": null
