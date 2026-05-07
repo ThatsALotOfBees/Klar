@@ -211,7 +211,11 @@ function Publish-KlarServerUrl {
     Write-Host "  Publishing new serverUrl to GitHub..." -ForegroundColor Cyan
     $current.serverUrl = $Url
     $current.updatedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    $current | ConvertTo-Json -Depth 10 | Set-Content -Path $serverJson -Encoding utf8
+    # Write WITHOUT a UTF-8 BOM. Set-Content -Encoding utf8 in Windows
+    # PowerShell 5.1 writes a BOM, which makes JSON.parse stricter parsers
+    # error and makes the file diff noisy on every commit.
+    $jsonText = ($current | ConvertTo-Json -Depth 10) + "`n"
+    [System.IO.File]::WriteAllText($serverJson, $jsonText, [System.Text.UTF8Encoding]::new($false))
 
     # Quietly commit + push. Don't fail `up` on a git error - the local
     # server + tunnel are still useful even if publish fails.
@@ -486,7 +490,24 @@ function Invoke-KlarTunnel {
     $ltJs = Join-Path $KlarRoot 'node_modules\localtunnel\bin\lt.js'
     $cmdArgs = @($ltJs, '--port', "$($Global:KlarPort)")
     if ($Subdomain) { $cmdArgs += @('--subdomain', $Subdomain) }
-    & node @cmdArgs
+
+    # Run lt foreground but parse each output line as it comes through.
+    # The first matching *.loca.lt URL gets pushed via Publish-KlarServerUrl
+    # so installed clients discover it via the GitHub-served server.json.
+    # Without this, friends would still hit whatever URL was last published
+    # (e.g. the pinned subdomain) even when the actual tunnel landed on a
+    # different one (taken/random) — that's exactly the gap that produced
+    # the recent "502 Bad Gateway" reports.
+    $script:_klarTunnelPublished = $false
+    & node @cmdArgs 2>&1 | ForEach-Object {
+        $line = $_
+        Write-Host $line
+        if (-not $script:_klarTunnelPublished -and $line -match 'https?://[A-Za-z0-9-]+\.loca\.lt') {
+            $url = $matches[0]
+            $script:_klarTunnelPublished = $true
+            try { Publish-KlarServerUrl -Url $url } catch { Write-Host "  publish failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+        }
+    }
 }
 Set-Alias tunnel Invoke-KlarTunnel -Scope Global
 

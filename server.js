@@ -680,7 +680,10 @@ route('GET', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) =
   if (!dm || !userInDm(me, dm)) return sendError(res, 404, 'dm not found');
   const url = new URL(req.url, 'http://x');
   const before = Number(url.searchParams.get('before')) || Date.now() + 1;
-  const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 100);
+  // Default to 1000 (and cap at 5000) — Klar conversations are small enough
+  // that returning the full history on first open is fine and saves a
+  // scrollback-pagination round-trip. Bump higher if anyone hits the cap.
+  const limit = Math.min(Number(url.searchParams.get('limit')) || 1000, 5000);
   const rows = db.prepare(`SELECT * FROM messages WHERE dm_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`)
     .all(dm.id, before, limit);
   send(res, 200, { messages: rows.reverse().map(messageRow) });
@@ -846,7 +849,10 @@ route('GET', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, cha
   if (!ch || !userIsServerMember(me.id, ch.server_id)) return sendError(res, 404, 'channel not found');
   const url = new URL(req.url, 'http://x');
   const before = Number(url.searchParams.get('before')) || Date.now() + 1;
-  const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 100);
+  // Default to 1000 (and cap at 5000) — Klar conversations are small enough
+  // that returning the full history on first open is fine and saves a
+  // scrollback-pagination round-trip. Bump higher if anyone hits the cap.
+  const limit = Math.min(Number(url.searchParams.get('limit')) || 1000, 5000);
   const rows = db.prepare(`SELECT * FROM channel_messages WHERE channel_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`)
     .all(channelId, before, limit);
   send(res, 200, { messages: rows.reverse().map(channelMessageRow) });
