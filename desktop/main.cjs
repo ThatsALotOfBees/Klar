@@ -39,13 +39,15 @@ let _sessionLogStream = null;
 let _sessionLogPath = null;
 
 function ensureSessionLog() {
-  if (_sessionLogStream) return;
+  if (_sessionLogPath) return;
   try {
     const dir = path.join(app.getPath('userData'), 'logs');
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     _sessionLogPath = path.join(dir, `${stamp}.log`);
-    _sessionLogStream = fs.createWriteStream(_sessionLogPath, { flags: 'a' });
+    // No createWriteStream — sessionLog() writes synchronously via
+    // appendFileSync now (see comment there). Stream-buffered logs were
+    // getting lost on hard exits.
     sessionLog('INFO', 'session.start', `Klar session ${stamp}`, {
       pid: process.pid, electron: process.versions.electron, chrome: process.versions.chrome,
       platform: process.platform, arch: process.arch, logFile: _sessionLogPath,
@@ -78,18 +80,23 @@ function sessionLog(level, category, message, extra) {
     }
     if (parts.length) line += (message ? ' ' : '') + parts.join(' ');
   }
-  if (_sessionLogStream) {
-    try { _sessionLogStream.write(line + '\n'); } catch {}
+  // Synchronous append so logs always land on disk even if the process is
+  // killed without graceful shutdown (X-button close, Task Manager kill,
+  // crash). The previous WriteStream implementation buffered up to 16 KB
+  // before flushing, which meant short sessions wrote nothing visible —
+  // exactly the bug we hit when trying to debug "stuck on connecting".
+  if (_sessionLogPath) {
+    try { fs.appendFileSync(_sessionLogPath, line + '\n'); } catch {}
   }
   // Also surface to main-process stdout for `npm run app` users.
   process.stdout.write(line + '\n');
 }
 
 function closeSessionLog() {
-  if (!_sessionLogStream) return;
+  if (!_sessionLogPath) return;
   sessionLog('INFO', 'session.end', 'closing log');
-  try { _sessionLogStream.end(); } catch {}
-  _sessionLogStream = null;
+  if (_sessionLogStream) { try { _sessionLogStream.end(); } catch {} _sessionLogStream = null; }
+  _sessionLogPath = null;
 }
 
 let mainWindow = null;
