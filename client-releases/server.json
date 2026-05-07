@@ -1,6 +1,6 @@
 {
     "_comment":  "Public Klar URL. Currently a custom domain backed by Caddy + Let\u0027s Encrypt on the host machine. Installed clients fetch this file on boot via the discoverServerUrl() flow, so they always know where to connect even if the URL changes. The dev-shell `tunnel` command auto-rewrites this if you fall back to localtunnel.",
-    "serverUrl":  "https://desktop-pjgbv71.tailfaf022.ts.net",
-    "updatedAt":  "2026-05-07T13:17:02.704Z",
+    "serverUrl":  "https://rare-cougar-13.loca.lt",
+    "updatedAt":  "2026-05-07T14:04:02.827Z",
     "host":  "ThatsALotOfBees"
 }
