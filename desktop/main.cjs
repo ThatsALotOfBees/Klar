@@ -391,6 +391,25 @@ app.on('before-quit', () => {
   closeSessionLog();
 });
 
+// Auto-grant media + screen-capture permissions for our renderer. Without
+// this, getUserMedia silently fails in Electron (no popup, no error
+// surfaced to the renderer) — which is what was causing the empty mic /
+// headphone dropdowns and the "stuck on connecting" calls (no audio
+// track to add to the peer connection). We're a single-purpose app, so
+// auto-allow is the right default; users can revoke at the OS level.
+function registerPermissionHandlers(s) {
+  s.setPermissionRequestHandler((webContents, permission, callback) => {
+    const ok = ['media', 'mediaKeySystem', 'display-capture', 'notifications', 'fullscreen'].includes(permission);
+    callback(!!ok);
+  });
+  // Newer Electron uses setPermissionCheckHandler for synchronous checks.
+  if (typeof s.setPermissionCheckHandler === 'function') {
+    s.setPermissionCheckHandler((webContents, permission) => {
+      return ['media', 'mediaKeySystem', 'display-capture', 'notifications', 'fullscreen'].includes(permission);
+    });
+  }
+}
+
 // getDisplayMedia handler — gives the renderer access to the OS screen /
 // window picker for screen sharing during a call. We register the handler
 // with useSystemPicker:true so Windows 10+ shows its native chrome (no
@@ -424,6 +443,7 @@ function registerDisplayMediaHandler(s) {
 (async () => {
   await app.whenReady();
   ensureSessionLog();
+  registerPermissionHandlers(session.defaultSession);
   registerDisplayMediaHandler(session.defaultSession);
   runtimeConfig = readConfig();
   sessionLog('INFO', 'app.config', 'resolved', {
