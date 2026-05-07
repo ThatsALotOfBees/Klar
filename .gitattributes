@@ -1,0 +1,19 @@
+# Force binary handling for the auto-update bundle. The manifest stores a
+# SHA256 hash of each file as it lives in client-releases/<version>/; git's
+# default CRLF conversion on Windows would rewrite line endings on commit
+# and produce a file on raw.githubusercontent.com that no longer matches
+# the recorded hash, breaking the auto-update integrity check at apply
+# time ("sha256 mismatch for app.js: expected ..., got ...").
+client-releases/** -text
+
+# Sounds + media must never be touched.
+*.mp3 -text
+*.wav -text
+*.ogg -text
+*.png -text
+*.ico -text
+
+# Keep the rest of the repo as the user's git config dictates (autocrlf
+# usually true on Windows, false on macOS/Linux). Source files are written
+# with LF in this repo regardless.
+* text=auto eol=lf
