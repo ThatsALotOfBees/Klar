@@ -40,6 +40,9 @@ contextBridge.exposeInMainWorld('klar', {
     info:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'INFO',  String(category || ''), String(message || ''), extra || null); } catch {} },
     warn:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'WARN',  String(category || ''), String(message || ''), extra || null); } catch {} },
     error: (category, message, extra) => { try { ipcRenderer.send('klar:log', 'ERROR', String(category || ''), String(message || ''), extra || null); } catch {} },
+    // Advanced settings → "Log directory" + "Open in Explorer" rely on these.
+    path:    () => ipcRenderer.invoke('klar:log-dir'),
+    openDir: () => ipcRenderer.invoke('klar:log-open-dir'),
   },
 });
 

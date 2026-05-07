@@ -12,7 +12,7 @@
 //     userData/client/ (auto-updated from a GitHub repo) and the renderer
 //     talks to the configured KLAR_CONFIG.serverUrl over HTTPS / WSS.
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
@@ -261,6 +261,11 @@ ipcMain.on('klar:log', (_e, level, category, message, extra) => {
 });
 
 ipcMain.handle('klar:check-now', async () => updater.checkOnce());
+ipcMain.handle('klar:log-dir', () => _sessionLogPath ? path.dirname(_sessionLogPath) : null);
+ipcMain.handle('klar:log-open-dir', () => {
+  if (!_sessionLogPath) return false;
+  try { shell.openPath(path.dirname(_sessionLogPath)); return true; } catch { return false; }
+});
 ipcMain.handle('klar:apply-update', async () => {
   const ok = await updater.applyPending();
   if (ok && mainWindow && !mainWindow.isDestroyed()) {

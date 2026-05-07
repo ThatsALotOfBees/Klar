@@ -610,6 +610,29 @@ route('GET', /^\/api\/me$/, async (req, res) => {
   send(res, 200, { user: selfUser(me) });
 });
 
+// PATCH /api/me — update mutable profile fields. Currently only displayName.
+// Username is immutable (used as filesystem identifier in DATA/ACCOUNTS).
+route('PATCH', /^\/api\/me$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const body = await readJson(req);
+  const updates = [];
+  const args = [];
+  if (typeof body.displayName === 'string') {
+    const dn = body.displayName.trim();
+    if (!dn || dn.length > 60) return sendError(res, 400, 'displayName must be 1-60 characters');
+    updates.push('display_name = ?');
+    args.push(dn);
+  }
+  if (!updates.length) return sendError(res, 400, 'no updatable fields provided');
+  args.push(me.id);
+  db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...args);
+  const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(me.id);
+  writeAccountKdb(updated);
+  log.info('user.update', 'profile updated', { user: updated.username, fields: updates.length });
+  send(res, 200, { user: selfUser(updated) });
+});
+
 route('GET', /^\/api\/users\/search/, async (req, res) => {
   const me = authedUser(req);
   if (!me) return sendError(res, 401, 'not authenticated');
@@ -978,6 +1001,30 @@ wss.on('connection', (ws, req) => {
       ws.send(JSON.stringify({ type: 'auth_ok' }));
     } else if (msg.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong' }));
+    } else if (msg.type && msg.type.startsWith('call.')) {
+      // WebRTC signaling relay for 1:1 voice calls. The server does not
+      // peek inside the SDP/ICE payloads — it just forwards them between
+      // the two parties of a DM. msg.toUserId identifies the recipient;
+      // we tag the forwarded message with the authenticated sender so the
+      // recipient can verify and ignore unsolicited offers.
+      if (!ws.userId) return;
+      const toUserId = String(msg.toUserId || '');
+      if (!toUserId || toUserId === ws.userId) return;
+      const subType = msg.type.slice(5); // 'invite' | 'accept' | 'decline' | 'signal' | 'hangup'
+      if (!['invite', 'accept', 'decline', 'signal', 'hangup'].includes(subType)) return;
+      const forward = {
+        type: msg.type,
+        fromUserId: ws.userId,
+        fromUsername: ws.username,
+        callId: msg.callId || null,
+        dmId: msg.dmId || null,
+        payload: msg.payload || null,
+      };
+      broadcastToUser(toUserId, forward);
+      // Light log — don't spam ICE candidate flow into the structured log.
+      if (subType !== 'signal') {
+        log.info('call.' + subType, 'relayed', { from: ws.username, to: toUserId.slice(0, 8), call: forward.callId });
+      }
     }
   });
   ws.on('close', (code, reason) => {
