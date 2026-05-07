@@ -178,6 +178,16 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at INTEGER NOT NULL,
   FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS blocks (
+  blocker_id TEXT NOT NULL,
+  blocked_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (blocker_id, blocked_id),
+  FOREIGN KEY (blocker_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (blocked_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
 `);
 
 // SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — we have to feature-
@@ -192,6 +202,9 @@ function addColumnIfMissing(table, column, decl) {
 }
 addColumnIfMissing('messages',         'attachments', 'TEXT');
 addColumnIfMissing('channel_messages', 'attachments', 'TEXT');
+// 'text' | 'announcement' (voice channels are a separate feature TBD).
+// Announcement channels: only the server owner can post.
+addColumnIfMissing('channels',         'kind',        "TEXT NOT NULL DEFAULT 'text'");
 
 db.exec(`
   -- placeholder so the surrounding template literal terminator stays valid
@@ -371,7 +384,27 @@ function publicServer(s) {
 }
 function channelRow(c) {
   if (!c) return null;
-  return { id: c.id, serverId: c.server_id, name: c.name, position: c.position, createdAt: c.created_at };
+  return {
+    id: c.id,
+    serverId: c.server_id,
+    name: c.name,
+    kind: c.kind || 'text',
+    position: c.position,
+    createdAt: c.created_at,
+  };
+}
+
+// Block lookups. blocks(blocker_id, blocked_id) — directional. We treat
+// either direction as "do not deliver", so once A blocks B neither side
+// sees the other's messages or DM list entry.
+function isBlocked(aId, bId) {
+  const row = db.prepare(
+    'SELECT 1 FROM blocks WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?)'
+  ).get(aId, bId, bId, aId);
+  return !!row;
+}
+function blockedByMe(meId, otherId) {
+  return !!db.prepare('SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?').get(meId, otherId);
 }
 function channelMessageRow(m) {
   return {
@@ -766,6 +799,43 @@ route('PATCH', /^\/api\/me$/, async (req, res) => {
   send(res, 200, { user: selfUser(updated) });
 });
 
+route('GET', /^\/api\/blocks$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const rows = db.prepare(`
+    SELECT u.* FROM blocks b
+    JOIN users u ON u.id = b.blocked_id
+    WHERE b.blocker_id = ?
+    ORDER BY b.created_at DESC
+  `).all(me.id);
+  send(res, 200, { blocks: rows.map(publicUser) });
+});
+
+route('POST', /^\/api\/users\/([a-f0-9]+)\/block$/, async (req, res, [, userId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (userId === me.id) return sendError(res, 400, 'cannot block yourself');
+  const other = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!other) return sendError(res, 404, 'user not found');
+  db.prepare('INSERT OR IGNORE INTO blocks (blocker_id, blocked_id, created_at) VALUES (?,?,?)')
+    .run(me.id, userId, Date.now());
+  log.info('user.block', 'blocked', { by: me.username, target: other.username });
+  // Tell both clients (mine + theirs) so DM lists refresh.
+  broadcastToUser(me.id,    { type: 'block_updated', userId: other.id, blocked: true,  by: 'me' });
+  broadcastToUser(other.id, { type: 'block_updated', userId: me.id,    blocked: true,  by: 'them' });
+  send(res, 200, { ok: true });
+});
+
+route('DELETE', /^\/api\/users\/([a-f0-9]+)\/block$/, async (req, res, [, userId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  db.prepare('DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?').run(me.id, userId);
+  log.info('user.unblock', 'unblocked', { by: me.username, target: userId.slice(0, 8) });
+  broadcastToUser(me.id,   { type: 'block_updated', userId, blocked: false, by: 'me' });
+  broadcastToUser(userId,  { type: 'block_updated', userId: me.id, blocked: false, by: 'them' });
+  send(res, 200, { ok: true });
+});
+
 route('GET', /^\/api\/users\/search/, async (req, res) => {
   const me = authedUser(req);
   if (!me) return sendError(res, 401, 'not authenticated');
@@ -784,11 +854,14 @@ route('GET', /^\/api\/dms$/, async (req, res) => {
     LEFT JOIN (SELECT dm_id, MAX(created_at) AS last_at FROM messages GROUP BY dm_id) m ON m.dm_id = d.id
     WHERE d.user_a = ? OR d.user_b = ?
     ORDER BY COALESCE(m.last_at, d.created_at) DESC`).all(me.id, me.id);
-  const out = rows.map((d) => {
+  const out = [];
+  for (const d of rows) {
     const otherId = d.user_a === me.id ? d.user_b : d.user_a;
+    // Hide DMs where either side has blocked the other.
+    if (isBlocked(me.id, otherId)) continue;
     const other = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId);
-    return { ...dmRow(d), other: publicUser(other), lastAt: d.last_at || d.created_at };
-  });
+    out.push({ ...dmRow(d), other: publicUser(other), lastAt: d.last_at || d.created_at });
+  }
   send(res, 200, { dms: out });
 });
 
@@ -799,6 +872,7 @@ route('POST', /^\/api\/dms$/, async (req, res) => {
   if (!userId || userId === me.id) return sendError(res, 400, 'invalid userId');
   const other = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
   if (!other) return sendError(res, 404, 'user not found');
+  if (isBlocked(me.id, other.id)) return sendError(res, 403, 'user is blocked');
   let dm = getDmFor(me, other.id);
   if (!dm) {
     const [a, b] = [me.id, other.id].sort();
@@ -850,6 +924,9 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   if (!me) return sendError(res, 401, 'not authenticated');
   const dm = db.prepare('SELECT * FROM dms WHERE id = ?').get(dmId);
   if (!dm || !userInDm(me, dm)) return sendError(res, 404, 'dm not found');
+  // Refuse if either side has blocked the other.
+  const otherId = otherUserId(me, dm);
+  if (isBlocked(me.id, otherId)) return sendError(res, 403, 'cannot send: user is blocked');
   const body = await readJson(req);
   const content = body.content || '';
   // E2EE was removed in 0.1.8; we ignore any encrypted/nonce fields a stale
@@ -1002,18 +1079,61 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/channels$/, async (req, res, [, ser
   const me = authedUser(req);
   if (!me) return sendError(res, 401, 'not authenticated');
   if (!userOwnsServer(me.id, serverId)) return sendError(res, 403, 'only the owner can create channels');
-  const { name } = await readJson(req);
-  const candidate = (name || '').toString().trim().toLowerCase();
+  const body = await readJson(req);
+  const candidate = (body.name || '').toString().trim().toLowerCase();
   if (!CHANNEL_NAME_RE.test(candidate)) return sendError(res, 400, `name must match ${CHANNEL_NAME_RE} (lowercase letters, digits, dash, underscore; max ${MAX_CHANNEL_NAME})`);
+  const kind = (body.kind === 'announcement') ? 'announcement' : 'text';
   const id = newId();
   const now = Date.now();
   const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM channels WHERE server_id = ?').get(serverId).p;
-  db.prepare('INSERT INTO channels (id, server_id, name, position, created_at) VALUES (?,?,?,?,?)').run(id, serverId, candidate, maxPos + 1, now);
+  db.prepare('INSERT INTO channels (id, server_id, name, kind, position, created_at) VALUES (?,?,?,?,?,?)')
+    .run(id, serverId, candidate, kind, maxPos + 1, now);
   const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
-  log.info('channel.create', 'new channel', { server: serverId, channel: id, name: candidate, by: me.username });
+  log.info('channel.create', 'new channel', { server: serverId, channel: id, name: candidate, kind, by: me.username });
   const payload = { type: 'channel_created', channel: channelRow(ch) };
   broadcastToServer(serverId, payload);
   send(res, 200, { channel: channelRow(ch) });
+});
+
+route('PATCH', /^\/api\/channels\/([a-f0-9]+)$/, async (req, res, [, channelId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  if (!ch) return sendError(res, 404, 'channel not found');
+  if (!userOwnsServer(me.id, ch.server_id)) return sendError(res, 403, 'only the owner can edit channels');
+  const body = await readJson(req);
+  const updates = []; const args = [];
+  if (typeof body.name === 'string') {
+    const n = body.name.trim().toLowerCase();
+    if (!CHANNEL_NAME_RE.test(n)) return sendError(res, 400, 'invalid channel name');
+    updates.push('name = ?'); args.push(n);
+  }
+  if (typeof body.kind === 'string') {
+    const k = (body.kind === 'announcement') ? 'announcement' : 'text';
+    updates.push('kind = ?'); args.push(k);
+  }
+  if (!updates.length) return sendError(res, 400, 'no updatable fields');
+  args.push(channelId);
+  db.prepare(`UPDATE channels SET ${updates.join(', ')} WHERE id = ?`).run(...args);
+  const updated = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  log.info('channel.update', 'edited', { channel: channelId, by: me.username, fields: updates.length });
+  broadcastToServer(ch.server_id, { type: 'channel_updated', channel: channelRow(updated) });
+  send(res, 200, { channel: channelRow(updated) });
+});
+
+route('DELETE', /^\/api\/channels\/([a-f0-9]+)$/, async (req, res, [, channelId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
+  if (!ch) return sendError(res, 404, 'channel not found');
+  if (!userOwnsServer(me.id, ch.server_id)) return sendError(res, 403, 'only the owner can delete channels');
+  // Refuse to delete the last channel — leaves the server unusable.
+  const count = db.prepare('SELECT COUNT(*) AS n FROM channels WHERE server_id = ?').get(ch.server_id).n;
+  if (count <= 1) return sendError(res, 400, 'cannot delete the last channel');
+  db.prepare('DELETE FROM channels WHERE id = ?').run(channelId);
+  log.info('channel.delete', 'deleted', { channel: channelId, by: me.username });
+  broadcastToServer(ch.server_id, { type: 'channel_deleted', serverId: ch.server_id, channelId });
+  send(res, 200, { ok: true });
 });
 
 route('GET', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, channelId]) => {
@@ -1037,6 +1157,10 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   if (!me) return sendError(res, 401, 'not authenticated');
   const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
   if (!ch || !userIsServerMember(me.id, ch.server_id)) return sendError(res, 404, 'channel not found');
+  // Announcement channels: only the server owner can post.
+  if (ch.kind === 'announcement' && !userOwnsServer(me.id, ch.server_id)) {
+    return sendError(res, 403, 'only the server owner can post in announcement channels');
+  }
   const body = await readJson(req);
   const content = (body.content || '').toString();
   const rawAtt = Array.isArray(body.attachments) ? body.attachments : [];
@@ -1177,6 +1301,8 @@ wss.on('connection', (ws, req) => {
       if (!ws.userId) return;
       const toUserId = String(msg.toUserId || '');
       if (!toUserId || toUserId === ws.userId) return;
+      // Refuse to relay if either side has blocked the other.
+      if (isBlocked(ws.userId, toUserId)) return;
       const subType = msg.type.slice(5); // 'invite' | 'accept' | 'decline' | 'signal' | 'hangup'
       if (!['invite', 'accept', 'decline', 'signal', 'hangup'].includes(subType)) return;
       const forward = {
