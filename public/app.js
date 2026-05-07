@@ -304,20 +304,43 @@ class CallManager {
     this._peerAnalyser = null;
   }
 
-  // ---- Outgoing ring tone (caller-side) ----
+  // ---- Outgoing/incoming ring tone ----
   _startDialing() {
     if (this._dialingAudio) return;
     try {
       const a = new Audio('sounds/dialing.mp3');
       a.loop = true; a.volume = 0.6;
-      a.play().catch(() => {});
+      // Track the play() promise so _stopDialing can wait for it to
+      // resolve before pausing — otherwise pause() can race a still-
+      // unresolved play() and the audio resumes itself when the play
+      // promise lands (a real Chromium quirk).
       this._dialingAudio = a;
+      this._dialingPlay = a.play();
+      if (this._dialingPlay && typeof this._dialingPlay.catch === 'function') {
+        this._dialingPlay.catch(() => {});
+      }
     } catch {}
   }
   _stopDialing() {
-    if (!this._dialingAudio) return;
-    try { this._dialingAudio.pause(); this._dialingAudio.currentTime = 0; } catch {}
+    const a = this._dialingAudio;
     this._dialingAudio = null;
+    if (!a) return;
+    const kill = () => {
+      try { a.pause(); } catch {}
+      try { a.loop = false; } catch {}
+      try { a.currentTime = 0; } catch {}
+      // Detach the source so the resource is fully released — without
+      // this, Chromium has been observed to keep looping a still-
+      // referenced media element even after pause + null.
+      try { a.removeAttribute('src'); a.load(); } catch {}
+    };
+    // Wait for any in-flight play() before pausing, then kill again
+    // afterwards to cover both ordering possibilities.
+    kill();
+    if (this._dialingPlay && typeof this._dialingPlay.then === 'function') {
+      this._dialingPlay.then(kill, kill);
+    }
+    this._dialingPlay = null;
   }
 
   // ---- Lifecycle ----
@@ -741,6 +764,11 @@ class CallManager {
         syncScreenShareButton();
         this.broadcastState();
         this._startSpeakingDetection();
+        // Belt-and-suspenders: kill the ring tone here too. accept() and
+        // onAccept() already do this, but if either path missed somehow
+        // (race, exception in the middle of accept), this is the last
+        // place where we know for sure the call is live.
+        this._stopDialing();
         if (this._iceTimeout) { clearTimeout(this._iceTimeout); this._iceTimeout = null; }
       } else if (s === 'failed' || s === 'closed' || s === 'disconnected') {
         if (this.state !== 'ended') this._teardown('Connection lost');
