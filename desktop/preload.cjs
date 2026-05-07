@@ -40,6 +40,14 @@ contextBridge.exposeInMainWorld('klar', {
   // Per-session logging bridge. Renderer-side log lines are forwarded to
   // the main process, which appends them to userData/Klar/logs/<ts>.log
   // for the lifetime of this Electron window.
+  // Screen-share custom picker. Returns [{id, name, kind, thumbnail}].
+  // The renderer uses the id as chromeMediaSourceId in a getUserMedia call,
+  // bypassing the OS display-media picker (which is flaky on some Win10
+  // configs).
+  screen: {
+    sources: () => ipcRenderer.invoke('klar:screen-sources'),
+  },
+
   log: {
     info:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'INFO',  String(category || ''), String(message || ''), extra || null); } catch {} },
     warn:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'WARN',  String(category || ''), String(message || ''), extra || null); } catch {} },

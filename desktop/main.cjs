@@ -318,6 +318,34 @@ ipcMain.on('klar:log', (_e, level, category, message, extra) => {
 });
 
 ipcMain.handle('klar:check-now', async () => updater.checkOnce());
+
+// Screen-share custom picker — desktopCapturer.getSources gives us all
+// screens + windows + thumbnails. The renderer renders the picker UI;
+// here we just supply the data. Returning the mediaSourceId lets the
+// renderer call getUserMedia with chromeMediaSource:'desktop' +
+// chromeMediaSourceId:<id> directly, bypassing the (sometimes flaky)
+// OS-level display-media picker entirely.
+ipcMain.handle('klar:screen-sources', async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: false,
+    });
+    return sources
+      .filter((s) => s.thumbnail && !s.thumbnail.isEmpty())
+      .map((s) => ({
+        id: s.id,
+        name: s.name || (s.id.startsWith('screen:') ? 'Screen' : 'Window'),
+        kind: s.id.startsWith('screen:') ? 'screen' : 'window',
+        // Data URL of the thumbnail. Small enough to ship over IPC.
+        thumbnail: s.thumbnail.toDataURL(),
+      }));
+  } catch (e) {
+    sessionLog('WARN', 'screen.sources', 'failed', { err: e.message });
+    return [];
+  }
+});
 ipcMain.handle('klar:show', () => { showWindow(); return true; });
 ipcMain.handle('klar:flash', () => {
   // Flash the taskbar icon to draw attention. Auto-clears on next focus.

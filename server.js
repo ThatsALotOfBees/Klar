@@ -1342,8 +1342,8 @@ wss.on('connection', (ws, req) => {
       if (!toUserId || toUserId === ws.userId) return;
       // Refuse to relay if either side has blocked the other.
       if (isBlocked(ws.userId, toUserId)) return;
-      const subType = msg.type.slice(5); // 'invite' | 'accept' | 'decline' | 'signal' | 'hangup'
-      if (!['invite', 'accept', 'decline', 'signal', 'hangup'].includes(subType)) return;
+      const subType = msg.type.slice(5); // 'invite' | 'accept' | 'decline' | 'signal' | 'hangup' | 'state'
+      if (!['invite', 'accept', 'decline', 'signal', 'hangup', 'state'].includes(subType)) return;
       const forward = {
         type: msg.type,
         fromUserId: ws.userId,
