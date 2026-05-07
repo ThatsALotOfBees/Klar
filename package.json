@@ -26,12 +26,14 @@
   "devDependencies": {
     "electron": "^33.0.0",
     "electron-builder": "^25.1.8",
-    "localtunnel": "^2.0.2"
+    "localtunnel": "^2.0.2",
+    "rcedit": "^5.0.2"
   },
   "build": {
     "appId": "chat.klar.desktop",
     "productName": "Klar",
     "copyright": "Copyright © 2026 Crystalix LLC",
+    "afterPack": "./scripts/after-pack.cjs",
     "asar": false,
     "files": [
       "desktop/**/*",
@@ -58,13 +60,23 @@
     },
     "win": {
       "target": [
-        { "target": "portable", "arch": ["x64"] },
-        { "target": "msi", "arch": ["x64"] }
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "msi",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "publisherName": "Crystalix LLC",
       "legalTrademarks": "Klar - Crystalix LLC",
-      "signAndEditExecutable": true,
+      "signAndEditExecutable": false,
       "forceCodeSigning": false
     },
     "portable": {

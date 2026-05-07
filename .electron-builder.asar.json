@@ -1,0 +1,52 @@
+{
+  "appId": "chat.klar.desktop",
+  "productName": "Klar",
+  "copyright": "Copyright © 2026 Crystalix LLC",
+  "afterPack": "./scripts/after-pack.cjs",
+  "asar": true,
+  "files": [
+    "desktop/**/*",
+    "public/**/*",
+    "server.js",
+    "client-config.json",
+    "package.json",
+    "build/icon.ico",
+    "!**/.gitignore",
+    "!**/*.md",
+    "!klar.db",
+    "!klar.db-*",
+    "!klar.log",
+    "!klar.err.log",
+    "!.klar.pid",
+    "!messages/**",
+    "!DATA/**",
+    "!dist/**",
+    "!dist-asar/**",
+    "!client-releases/**",
+    "!scripts/**"
+  ],
+  "directories": {
+    "output": "dist-asar"
+  },
+  "win": {
+    "target": [
+      { "target": "portable", "arch": ["x64"] },
+      { "target": "msi", "arch": ["x64"] }
+    ],
+    "icon": "build/icon.ico",
+    "publisherName": "Crystalix LLC",
+    "legalTrademarks": "Klar - Crystalix LLC",
+    "signAndEditExecutable": false,
+    "forceCodeSigning": false
+  },
+  "portable": {
+    "artifactName": "Klar-${version}-portable.exe"
+  },
+  "msi": {
+    "oneClick": false,
+    "perMachine": false,
+    "runAfterFinish": true,
+    "warningsAsErrors": false,
+    "artifactName": "Klar-${version}.msi"
+  }
+}
