@@ -12,11 +12,19 @@
 //     userData/client/ (auto-updated from a GitHub repo) and the renderer
 //     talks to the configured KLAR_CONFIG.serverUrl over HTTPS / WSS.
 
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const updater = require('./updater.cjs');
+
+// Tray / minimize-to-tray. Defaults to enabled; renderer can toggle via IPC
+// (Settings → Advanced → "Minimize to tray on close"). When enabled, the
+// window's 'close' event hides the window instead of quitting; the user has
+// to explicitly choose Quit from the tray menu.
+let _tray = null;
+let _minimizeToTray = true;
+let _quittingForReal = false;
 
 // ---------- Per-session log file ----------
 //
@@ -231,10 +239,59 @@ async function createWindow() {
   mainWindow.on('closed', () => { mainWindow = null; });
   mainWindow.on('maximize',   () => pushMaxState());
   mainWindow.on('unmaximize', () => pushMaxState());
+  // Stop flashing the taskbar once the user looks at the window again.
+  mainWindow.on('focus', () => { try { mainWindow.flashFrame(false); } catch {} });
+
+  // Minimize-to-tray: when the user closes the window we hide it instead of
+  // quitting, so DM notifications keep arriving in the background. The user
+  // explicitly chooses Quit from the tray menu (or sets the toggle off in
+  // Settings → Advanced).
+  mainWindow.on('close', (e) => {
+    if (_minimizeToTray && !_quittingForReal && !app.isQuiting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
 
   if (app.isPackaged) updater.setWindow(mainWindow);
 
   await loadAction(mainWindow);
+  ensureTray();
+}
+
+function ensureTray() {
+  if (_tray) return;
+  // Find an icon. In dev we can fall back to the build/icon.ico shipped in
+  // the repo. In packaged builds it's bundled by electron-builder.
+  let iconPath = path.join(__dirname, '..', 'build', 'icon.ico');
+  if (app.isPackaged) {
+    const packaged = path.join(process.resourcesPath, 'build', 'icon.ico');
+    if (fs.existsSync(packaged)) iconPath = packaged;
+  }
+  let img = nativeImage.createFromPath(iconPath);
+  if (img.isEmpty()) {
+    // Tiny 16x16 transparent placeholder so Tray() doesn't throw.
+    img = nativeImage.createEmpty();
+  }
+  try {
+    _tray = new Tray(img);
+    _tray.setToolTip('Klar');
+    _tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Show Klar', click: () => showWindow() },
+      { type: 'separator' },
+      { label: 'Quit',      click: () => { _quittingForReal = true; app.isQuiting = true; app.quit(); } },
+    ]));
+    _tray.on('click', () => showWindow());
+  } catch (e) {
+    sessionLog('WARN', 'tray.init', 'tray creation failed', { err: e.message });
+  }
+}
+
+function showWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  try { mainWindow.focus(); } catch {}
 }
 
 function pushMaxState() {
@@ -261,6 +318,19 @@ ipcMain.on('klar:log', (_e, level, category, message, extra) => {
 });
 
 ipcMain.handle('klar:check-now', async () => updater.checkOnce());
+ipcMain.handle('klar:show', () => { showWindow(); return true; });
+ipcMain.handle('klar:flash', () => {
+  // Flash the taskbar icon to draw attention. Auto-clears on next focus.
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFocused()) {
+    try { mainWindow.flashFrame(true); } catch {}
+  }
+  return true;
+});
+ipcMain.handle('klar:set-minimize-to-tray', (_e, on) => {
+  _minimizeToTray = !!on;
+  return _minimizeToTray;
+});
+ipcMain.handle('klar:get-minimize-to-tray', () => _minimizeToTray);
 ipcMain.handle('klar:log-dir', () => _sessionLogPath ? path.dirname(_sessionLogPath) : null);
 ipcMain.handle('klar:log-open-dir', () => {
   if (!_sessionLogPath) return false;
@@ -277,7 +347,13 @@ ipcMain.handle('klar:apply-update', async () => {
 
 // ---------- Lifecycle ----------
 
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  // With minimize-to-tray on (default) we keep the app alive in the tray
+  // even if every window has closed; the user has to choose Quit from
+  // the tray menu. macOS already follows this convention by default.
+  if (process.platform !== 'darwin' && !_minimizeToTray) app.quit();
+});
+app.on('activate', () => { if (mainWindow) showWindow(); });
 app.on('before-quit', () => {
   app.isQuiting = true;
   updater.dispose();

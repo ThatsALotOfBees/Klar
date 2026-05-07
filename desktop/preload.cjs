@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('klar', {
     minimize:         () => ipcRenderer.invoke('klar:minimize'),
     toggleMaximize:   () => ipcRenderer.invoke('klar:toggle-maximize'),
     isMaximized:      () => ipcRenderer.invoke('klar:is-maximized'),
+    show:             () => ipcRenderer.invoke('klar:show'),
+    flash:            () => ipcRenderer.invoke('klar:flash'),
+    setMinimizeToTray:(on) => ipcRenderer.invoke('klar:set-minimize-to-tray', !!on),
+    getMinimizeToTray:() => ipcRenderer.invoke('klar:get-minimize-to-tray'),
     onMaxStateChange: (cb) => {
       const listener = (_e, isMax) => cb(!!isMax);
       ipcRenderer.on('klar:max-state', listener);

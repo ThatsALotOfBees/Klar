@@ -181,7 +181,22 @@ function Start-KlarBackground {
         $url = Get-KlarTunnelUrl
         if ($url) {
             Write-Host "Klar tunnel up:  $url" -ForegroundColor Cyan
-            Publish-KlarServerUrl -Url $url
+            # Don't auto-publish if the current server.json points at a
+            # stable URL (Tailscale Funnel, custom domain) — otherwise `up`
+            # would clobber the good URL with a flaky loca.lt URL on every
+            # restart. Only publish if the existing URL is itself a loca.lt
+            # URL or empty.
+            $existing = ''
+            if (Test-Path $Global:KlarConfigFile) {}
+            $serverJson = Join-Path $KlarRoot 'client-releases\server.json'
+            if (Test-Path $serverJson) {
+                try { $existing = (Get-Content $serverJson -Raw | ConvertFrom-Json).serverUrl } catch {}
+            }
+            if (-not $existing -or $existing -match '\.loca\.lt') {
+                Publish-KlarServerUrl -Url $url
+            } else {
+                Write-Host "  (skipping publish: current serverUrl is a stable URL: $existing)" -ForegroundColor DarkGray
+            }
         } else {
             Write-Host "Klar tunnel started (pid $($tunnelProc.Id)) but no URL yet - check 'logs'." -ForegroundColor Yellow
         }

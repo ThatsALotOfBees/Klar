@@ -20,8 +20,10 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const DB_PATH = path.join(DATA_ROOT, 'klar.db');
 const KDB_DIR = path.join(DATA_ROOT, 'messages');
 const ACCOUNTS_DIR = path.join(DATA_ROOT, 'DATA', 'ACCOUNTS');
+const UPLOADS_DIR = path.join(DATA_ROOT, 'DATA', 'UPLOADS');
 const PORT = Number(process.env.PORT) || 3000;
 const KDB_VERSION = 1;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MiB per file
 
 // .KDB archive: per-DM, per-day JSON Lines log of every message ever sent in
 // the conversation. SQLite is still the operational store (indexed, queried);
@@ -76,6 +78,7 @@ function appendKdb(usernameA, usernameB, senderUsername, message) {
       content: message.content,
     };
     if (message.encrypted) record.nonce = message.nonce;
+    if (message.attachments && message.attachments.length) record.attachments = message.attachments;
     fs.appendFileSync(file, JSON.stringify(record) + '\n');
   } catch (e) {
     console.error('appendKdb failed', e);
@@ -165,6 +168,33 @@ CREATE TABLE IF NOT EXISTS channel_messages (
   FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_chmsg_ch_created ON channel_messages(channel_id, created_at);
+
+CREATE TABLE IF NOT EXISTS uploads (
+  id TEXT PRIMARY KEY,
+  uploader_id TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`);
+
+// SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — we have to feature-
+// detect and ALTER conditionally. The `attachments` column on messages /
+// channel_messages stores a JSON array of {url, name, mime, size} objects;
+// older rows have NULL and render as "no attachments" without breaking.
+function addColumnIfMissing(table, column, decl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+}
+addColumnIfMissing('messages',         'attachments', 'TEXT');
+addColumnIfMissing('channel_messages', 'attachments', 'TEXT');
+
+db.exec(`
+  -- placeholder so the surrounding template literal terminator stays valid
 
 CREATE TABLE IF NOT EXISTS invites (
   code TEXT PRIMARY KEY,
@@ -271,7 +301,24 @@ function messageRow(m) {
     nonce: m.nonce,
     encrypted: !!m.encrypted,
     createdAt: m.created_at,
+    attachments: parseAttachments(m.attachments),
   };
+}
+
+function parseAttachments(raw) {
+  if (!raw) return [];
+  try { const v = JSON.parse(raw); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
+function sanitizeFilename(name) {
+  // Strip path separators + control chars; cap at a reasonable length.
+  let s = String(name || 'file').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').trim();
+  if (!s) s = 'file';
+  if (s.length > 100) {
+    const ext = path.extname(s);
+    s = s.slice(0, 100 - ext.length) + ext;
+  }
+  return s;
 }
 
 function getUserByToken(token) {
@@ -333,6 +380,7 @@ function channelMessageRow(m) {
     senderId: m.sender_id,
     content: m.content,
     createdAt: m.created_at,
+    attachments: parseAttachments(m.attachments),
   };
 }
 
@@ -378,6 +426,7 @@ function appendKdbChannel(server, channel, senderUsername, message) {
       from: senderUsername,
       content: message.content,
     };
+    if (message.attachments && message.attachments.length) record.attachments = message.attachments;
     fs.appendFileSync(file, JSON.stringify(record) + '\n');
   } catch (e) {
     console.error('appendKdbChannel failed', e);
@@ -402,6 +451,7 @@ function appendKdbChannel(server, channel, senderUsername, message) {
 function ensureAccountsDir() {
   if (!fs.existsSync(ACCOUNTS_DIR)) fs.mkdirSync(ACCOUNTS_DIR, { recursive: true });
 }
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 function writeAccountKdb(u) {
   ensureAccountsDir();
@@ -520,10 +570,39 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.ico': 'image/x-icon',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.webm': 'video/webm',
+  '.mp4': 'video/mp4',
 };
 
 async function serveStatic(req, res) {
   const urlPath = decodeURIComponent(req.url.split('?')[0]);
+
+  // /uploads/<id>/<filename> -> DATA/UPLOADS/<id>/<filename>
+  // We look up the row to validate the id exists and to reject stray
+  // requests, but we serve the file straight from disk for streaming.
+  if (urlPath.startsWith('/uploads/')) {
+    const m = urlPath.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
+    if (!m) return sendError(res, 404, 'not found');
+    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m[1]);
+    if (!row) return sendError(res, 404, 'not found');
+    const file = path.join(UPLOADS_DIR, row.id, row.filename);
+    try {
+      const stat = await fs.promises.stat(file);
+      const stream = fs.createReadStream(file);
+      res.writeHead(200, {
+        'Content-Type': row.mime || 'application/octet-stream',
+        'Content-Length': stat.size,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      });
+      return stream.pipe(res);
+    } catch {
+      return sendError(res, 404, 'not found');
+    }
+  }
+
   const safe = path.normalize(urlPath).replace(/^([\\/])+/, '');
   let filePath = path.join(PUBLIC_DIR, safe === '' ? 'index.html' : safe);
   if (!filePath.startsWith(PUBLIC_DIR)) return sendError(res, 403, 'forbidden');
@@ -541,6 +620,60 @@ async function serveStatic(req, res) {
   } catch (e) {
     sendError(res, 404, 'not found');
   }
+}
+
+// POST /api/uploads — single-file upload. The renderer sets:
+//   Content-Type:    <mime/type>
+//   X-Klar-Filename: original-filename.ext   (optional; defaults to "file")
+// and PUTs the raw bytes. We avoid multipart entirely because parsing it in
+// vanilla Node is annoying and Klar's clients are all in our control.
+async function handleUpload(req, res) {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const declared = Number(req.headers['content-length'] || '0');
+  if (declared > MAX_UPLOAD_BYTES) return sendError(res, 413, `file too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB)`);
+  const mime = (req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim();
+  const rawName = req.headers['x-klar-filename'] || 'file';
+  const safeName = sanitizeFilename(decodeURIComponent(String(rawName)));
+
+  const id = newId();
+  const dir = path.join(UPLOADS_DIR, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, safeName);
+
+  let total = 0;
+  let aborted = false;
+  const ws = fs.createWriteStream(target);
+  await new Promise((resolve, reject) => {
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_UPLOAD_BYTES) {
+        aborted = true;
+        ws.destroy();
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        sendError(res, 413, `file too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB)`);
+        req.destroy();
+        return reject(new Error('too large'));
+      }
+      ws.write(c);
+    });
+    req.on('end', () => { ws.end(); });
+    req.on('error', reject);
+    ws.on('finish', resolve);
+    ws.on('error', reject);
+  }).catch(() => {});
+  if (aborted) return;
+  if (!total) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    return sendError(res, 400, 'empty file');
+  }
+
+  db.prepare('INSERT INTO uploads (id, uploader_id, filename, mime, size, created_at) VALUES (?,?,?,?,?,?)')
+    .run(id, me.id, safeName, mime, total, Date.now());
+
+  const url = `/uploads/${id}/${encodeURIComponent(safeName)}`;
+  log.info('upload.create', 'file received', { user: me.username, id, mime, bytes: total, name: safeName });
+  send(res, 200, { id, url, filename: safeName, mime, size: total });
 }
 
 const routes = [];
@@ -718,11 +851,29 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   const dm = db.prepare('SELECT * FROM dms WHERE id = ?').get(dmId);
   if (!dm || !userInDm(me, dm)) return sendError(res, 404, 'dm not found');
   const body = await readJson(req);
-  const content = body.content;
+  const content = body.content || '';
   // E2EE was removed in 0.1.8; we ignore any encrypted/nonce fields a stale
   // client might still send and store the message as plaintext.
-  if (typeof content !== 'string' || !content.trim()) return sendError(res, 400, 'content required');
+  const rawAtt = Array.isArray(body.attachments) ? body.attachments : [];
+  // A message must have content OR attachments. Attachment-only messages
+  // (e.g. just an image upload) are valid.
+  if ((typeof content !== 'string' || !content.trim()) && rawAtt.length === 0) {
+    return sendError(res, 400, 'content or attachments required');
+  }
   if (content.length > 4000) return sendError(res, 400, 'content too long');
+
+  // Validate attachment refs — they must point at uploads we own. Drop any
+  // bogus entries silently.
+  const attachments = [];
+  for (const a of rawAtt.slice(0, 10)) {
+    if (!a || typeof a.url !== 'string') continue;
+    const m = a.url.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
+    if (!m) continue;
+    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m[1]);
+    if (!row) continue;
+    attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+  }
+  const attJson = attachments.length ? JSON.stringify(attachments) : null;
 
   // Optional client-side tracking id, used by the optimistic-send UI to
   // match the WS broadcast against the dimmed local row and replace it.
@@ -730,9 +881,9 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
 
   const id = newId();
   const createdAt = Date.now();
-  db.prepare('INSERT INTO messages (id, dm_id, sender_id, content, nonce, encrypted, created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(id, dm.id, me.id, content, null, 0, createdAt);
-  const message = messageRow({ id, dm_id: dm.id, sender_id: me.id, content, nonce: null, encrypted: 0, created_at: createdAt });
+  db.prepare('INSERT INTO messages (id, dm_id, sender_id, content, nonce, encrypted, created_at, attachments) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, dm.id, me.id, content, null, 0, createdAt, attJson);
+  const message = messageRow({ id, dm_id: dm.id, sender_id: me.id, content, nonce: null, encrypted: 0, created_at: createdAt, attachments: attJson });
   if (clientId) message.clientId = clientId;
 
   // Also append to the on-disk .KDB archive for this conversation.
@@ -888,14 +1039,27 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   if (!ch || !userIsServerMember(me.id, ch.server_id)) return sendError(res, 404, 'channel not found');
   const body = await readJson(req);
   const content = (body.content || '').toString();
-  if (!content.trim()) return sendError(res, 400, 'content required');
+  const rawAtt = Array.isArray(body.attachments) ? body.attachments : [];
+  if (!content.trim() && rawAtt.length === 0) return sendError(res, 400, 'content or attachments required');
   if (content.length > 4000) return sendError(res, 400, 'content too long');
+
+  const attachments = [];
+  for (const a of rawAtt.slice(0, 10)) {
+    if (!a || typeof a.url !== 'string') continue;
+    const m2 = a.url.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
+    if (!m2) continue;
+    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m2[1]);
+    if (!row) continue;
+    attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+  }
+  const attJson = attachments.length ? JSON.stringify(attachments) : null;
+
   const clientId = (typeof body.clientId === 'string' && body.clientId.length <= 64) ? body.clientId : null;
   const id = newId();
   const createdAt = Date.now();
-  db.prepare('INSERT INTO channel_messages (id, channel_id, sender_id, content, created_at) VALUES (?,?,?,?,?)')
-    .run(id, channelId, me.id, content, createdAt);
-  const message = channelMessageRow({ id, channel_id: channelId, sender_id: me.id, content, created_at: createdAt });
+  db.prepare('INSERT INTO channel_messages (id, channel_id, sender_id, content, created_at, attachments) VALUES (?,?,?,?,?,?)')
+    .run(id, channelId, me.id, content, createdAt, attJson);
+  const message = channelMessageRow({ id, channel_id: channelId, sender_id: me.id, content, created_at: createdAt, attachments: attJson });
   if (clientId) message.clientId = clientId;
 
   // Append to .KDB archive.
@@ -955,9 +1119,12 @@ route('POST', /^\/api\/invites\/([A-Za-z0-9]+)\/accept$/, async (req, res, [, co
 const server = http.createServer(async (req, res) => {
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminder');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminder, X-Klar-Filename');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    if (req.url === '/api/uploads' && req.method === 'POST') {
+      return handleUpload(req, res);
+    }
     if (req.url.startsWith('/api/')) {
       const url = req.url.split('?')[0];
       for (const r of routes) {

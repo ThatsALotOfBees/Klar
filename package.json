@@ -1,6 +1,6 @@
 {
   "name": "klar",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Klar — a minimal Discord-style chat with optional per-DM end-to-end encryption.",
   "author": "ThatsALotOfBees",
   "type": "module",
@@ -36,6 +36,7 @@
       "server.js",
       "client-config.json",
       "package.json",
+      "build/icon.ico",
       "!**/.gitignore",
       "!**/*.md",
       "!klar.db",

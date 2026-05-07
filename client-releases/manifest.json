@@ -1,23 +1,27 @@
 {
-  "version": "0.1.12",
-  "releasedAt": "2026-05-07T13:56:49.326Z",
+  "version": "0.1.13",
+  "releasedAt": "2026-05-07T14:10:58.657Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",
-      "sha256": "061eac34b27423751c500c008df3d3fccf4ce0d7815854bc4ce0425148fe6747"
+      "sha256": "841e37a6d14489a2eae8cb0124097c39522659f0a47709328f9dcf58201de19f"
     },
     {
       "path": "app.js",
-      "sha256": "41e72edec998decc62ee64b9204a691bc40faa7d58fa24fd0594b1d11f30f4c1"
+      "sha256": "2b6567799ff47b1a30b60dcb7ed8b9d4a3d5e4d01e3c23942f02ac384579f1e4"
     },
     {
       "path": "index.html",
-      "sha256": "545b3894b9d5578794dab453ddb660eebc7dad780eab1fcad21a4f417a9419dc"
+      "sha256": "12f96cc69c6c0f995fcd84eb2a1ca08421bcd97596948e22aae42c939e4eaaeb"
+    },
+    {
+      "path": "sounds/notify.mp3",
+      "sha256": "053a2fe627916e048af1ce04b356988f3844754f370ea169f16bdf8f72eb0d07"
     },
     {
       "path": "styles.css",
-      "sha256": "ae36dd12c99d5c02ab46a61eff0821c462b57d55b625427ac6c33bb63b3234f1"
+      "sha256": "36522f7a0c3d22add080a16b7588a0952f5ec62b51b36c352edf2898ad8c7ba3"
     }
   ],
   "notes": null
