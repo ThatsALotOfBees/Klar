@@ -18,6 +18,72 @@ const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const updater = require('./updater.cjs');
 
+// ---------- Per-session log file ----------
+//
+// The renderer pipes log lines here over IPC. We append them to a fresh
+// file under <userData>/Klar/logs/<ts>.log for the lifetime of this Electron
+// window, plus mirror to the main-process stdout (which the dev shell can
+// capture via `npm run app`). Main-process events (boot, shutdown, IPC
+// handlers themselves) are also written so the file is a complete
+// per-session record.
+
+let _sessionLogStream = null;
+let _sessionLogPath = null;
+
+function ensureSessionLog() {
+  if (_sessionLogStream) return;
+  try {
+    const dir = path.join(app.getPath('userData'), 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    _sessionLogPath = path.join(dir, `${stamp}.log`);
+    _sessionLogStream = fs.createWriteStream(_sessionLogPath, { flags: 'a' });
+    sessionLog('INFO', 'session.start', `Klar session ${stamp}`, {
+      pid: process.pid, electron: process.versions.electron, chrome: process.versions.chrome,
+      platform: process.platform, arch: process.arch, logFile: _sessionLogPath,
+    });
+    // Best-effort housekeeping — keep the 50 newest log files.
+    try {
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.log'));
+      files.sort();
+      if (files.length > 50) {
+        for (const f of files.slice(0, files.length - 50)) {
+          try { fs.unlinkSync(path.join(dir, f)); } catch {}
+        }
+      }
+    } catch {}
+  } catch (e) {
+    console.error('[klar] failed to open session log:', e.message);
+  }
+}
+
+function sessionLog(level, category, message, extra) {
+  const ts = new Date().toISOString();
+  let line = `[${ts}] ${String(level).padEnd(5)} ${String(category || '').padEnd(22)} ${message || ''}`;
+  if (extra && typeof extra === 'object') {
+    const parts = [];
+    for (const k of Object.keys(extra)) {
+      const v = extra[k];
+      if (v === undefined || v === null) continue;
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      parts.push(`${k}=${s}`);
+    }
+    if (parts.length) line += (message ? ' ' : '') + parts.join(' ');
+  }
+  if (_sessionLogStream) {
+    try { _sessionLogStream.write(line + '\n'); } catch {}
+  }
+  // Also surface to main-process stdout for `npm run app` users.
+  process.stdout.write(line + '\n');
+}
+
+function closeSessionLog() {
+  if (!_sessionLogStream) return;
+  sessionLog('INFO', 'session.end', 'closing log');
+  try { _sessionLogStream.end(); } catch {}
+  _sessionLogStream = null;
+}
+
 let mainWindow = null;
 let serverProc = null;
 let runtimeConfig = null; // resolved KLAR_CONFIG (server URL etc.) for this run
@@ -189,6 +255,11 @@ ipcMain.handle('klar:toggle-maximize', () => {
 });
 ipcMain.handle('klar:is-maximized',    () => mainWindow ? mainWindow.isMaximized() : false);
 
+// Renderer-side log lines pipe in here.
+ipcMain.on('klar:log', (_e, level, category, message, extra) => {
+  sessionLog(level || 'INFO', category, message, extra);
+});
+
 ipcMain.handle('klar:check-now', async () => updater.checkOnce());
 ipcMain.handle('klar:apply-update', async () => {
   const ok = await updater.applyPending();
@@ -208,15 +279,24 @@ app.on('before-quit', () => {
   if (serverProc && !serverProc.killed) {
     try { serverProc.kill(); } catch {}
   }
+  closeSessionLog();
 });
 
 (async () => {
   await app.whenReady();
+  ensureSessionLog();
   runtimeConfig = readConfig();
+  sessionLog('INFO', 'app.config', 'resolved', {
+    serverUrl: runtimeConfig.serverUrl,
+    version: runtimeConfig.version,
+    updateRepo: runtimeConfig.updateRepo,
+    isPackaged: app.isPackaged,
+  });
   try {
     await createWindow();
+    sessionLog('INFO', 'app.window', 'shown');
   } catch (e) {
-    console.error('klar electron startup failed:', e);
+    sessionLog('ERROR', 'app.startup', 'failed', { err: e.message });
     app.quit();
   }
 })().catch((e) => {

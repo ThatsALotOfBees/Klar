@@ -548,10 +548,15 @@ function route(method, pattern, handler) { routes.push({ method, pattern, handle
 
 route('POST', /^\/api\/register$/, async (req, res) => {
   const body = await readJson(req);
-  const { username, displayName, password, publicKey, encryptedPrivateKey, encryptedPrivateKeyNonce, keySalt } = body;
+  const { username, displayName, password } = body;
   if (typeof username !== 'string' || !/^[a-z0-9_.-]{3,24}$/i.test(username)) return sendError(res, 400, 'invalid username (3-24 chars, letters/digits/._-)');
   if (typeof password !== 'string' || password.length < 8) return sendError(res, 400, 'password must be at least 8 characters');
-  if (!publicKey || !encryptedPrivateKey || !encryptedPrivateKeyNonce || !keySalt) return sendError(res, 400, 'missing key material');
+  // Key material is optional now (E2EE was removed in 0.1.8). Older clients
+  // may still send the fields; we accept them but never use them.
+  const publicKey                = (body.publicKey || '');
+  const encryptedPrivateKey      = (body.encryptedPrivateKey || '');
+  const encryptedPrivateKeyNonce = (body.encryptedPrivateKeyNonce || '');
+  const keySalt                  = (body.keySalt || '');
   const lname = username.toLowerCase();
   const dname = (displayName && String(displayName).trim()) || username;
   const exists = db.prepare('SELECT 1 FROM users WHERE username = ?').get(lname);
@@ -687,20 +692,22 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   const dm = db.prepare('SELECT * FROM dms WHERE id = ?').get(dmId);
   if (!dm || !userInDm(me, dm)) return sendError(res, 404, 'dm not found');
   const body = await readJson(req);
-  const encrypted = !!body.encrypted;
-  let content = body.content;
-  let nonce = body.nonce || null;
-  if (encrypted) {
-    if (typeof content !== 'string' || typeof nonce !== 'string') return sendError(res, 400, 'ciphertext and nonce required');
-  } else {
-    if (typeof content !== 'string' || !content.trim()) return sendError(res, 400, 'content required');
-    if (content.length > 4000) return sendError(res, 400, 'content too long');
-  }
+  const content = body.content;
+  // E2EE was removed in 0.1.8; we ignore any encrypted/nonce fields a stale
+  // client might still send and store the message as plaintext.
+  if (typeof content !== 'string' || !content.trim()) return sendError(res, 400, 'content required');
+  if (content.length > 4000) return sendError(res, 400, 'content too long');
+
+  // Optional client-side tracking id, used by the optimistic-send UI to
+  // match the WS broadcast against the dimmed local row and replace it.
+  const clientId = (typeof body.clientId === 'string' && body.clientId.length <= 64) ? body.clientId : null;
+
   const id = newId();
   const createdAt = Date.now();
   db.prepare('INSERT INTO messages (id, dm_id, sender_id, content, nonce, encrypted, created_at) VALUES (?,?,?,?,?,?,?)')
-    .run(id, dm.id, me.id, content, nonce, encrypted ? 1 : 0, createdAt);
-  const message = messageRow({ id, dm_id: dm.id, sender_id: me.id, content, nonce, encrypted: encrypted ? 1 : 0, created_at: createdAt });
+    .run(id, dm.id, me.id, content, null, 0, createdAt);
+  const message = messageRow({ id, dm_id: dm.id, sender_id: me.id, content, nonce: null, encrypted: 0, created_at: createdAt });
+  if (clientId) message.clientId = clientId;
 
   // Also append to the on-disk .KDB archive for this conversation.
   const userA = db.prepare('SELECT username FROM users WHERE id = ?').get(dm.user_a);
@@ -710,7 +717,7 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   log.info('msg.dm', 'message sent', {
     dm: dm.id, from: me.username,
     to: (me.id === dm.user_a ? userB && userB.username : userA && userA.username) || '?',
-    encrypted: !!encrypted, bytes: (content || '').length,
+    bytes: content.length,
   });
 
   const payload = { type: 'message', message };
@@ -854,11 +861,13 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   const content = (body.content || '').toString();
   if (!content.trim()) return sendError(res, 400, 'content required');
   if (content.length > 4000) return sendError(res, 400, 'content too long');
+  const clientId = (typeof body.clientId === 'string' && body.clientId.length <= 64) ? body.clientId : null;
   const id = newId();
   const createdAt = Date.now();
   db.prepare('INSERT INTO channel_messages (id, channel_id, sender_id, content, created_at) VALUES (?,?,?,?,?)')
     .run(id, channelId, me.id, content, createdAt);
   const message = channelMessageRow({ id, channel_id: channelId, sender_id: me.id, content, created_at: createdAt });
+  if (clientId) message.clientId = clientId;
 
   // Append to .KDB archive.
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(ch.server_id);

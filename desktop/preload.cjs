@@ -32,6 +32,15 @@ contextBridge.exposeInMainWorld('klar', {
     apply: () => ipcRenderer.invoke('klar:apply-update'),
     checkNow: () => ipcRenderer.invoke('klar:check-now'),
   },
+
+  // Per-session logging bridge. Renderer-side log lines are forwarded to
+  // the main process, which appends them to userData/Klar/logs/<ts>.log
+  // for the lifetime of this Electron window.
+  log: {
+    info:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'INFO',  String(category || ''), String(message || ''), extra || null); } catch {} },
+    warn:  (category, message, extra) => { try { ipcRenderer.send('klar:log', 'WARN',  String(category || ''), String(message || ''), extra || null); } catch {} },
+    error: (category, message, extra) => { try { ipcRenderer.send('klar:log', 'ERROR', String(category || ''), String(message || ''), extra || null); } catch {} },
+  },
 });
 
 // `KLAR_CONFIG` carries `serverUrl` and `version`. The main process passes it
