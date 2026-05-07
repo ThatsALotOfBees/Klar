@@ -709,6 +709,140 @@ async function handleUpload(req, res) {
   send(res, 200, { id, url, filename: safeName, mime, size: total });
 }
 
+// POST /api/uploads/catbox — proxy upload to catbox.moe.
+// catbox doesn't send CORS headers, so browsers can't POST to it directly.
+// We buffer the body in memory (capped at MAX_UPLOAD_BYTES), forward via
+// multipart/form-data, and return the catbox URL. Catbox-hosted media
+// embeds via the same URL-extension detection as any other CDN.
+async function handleCatboxUpload(req, res) {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const declared = Number(req.headers['content-length'] || '0');
+  if (declared > MAX_UPLOAD_BYTES) return sendError(res, 413, `file too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB)`);
+  const mime = (req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim();
+  const rawName = req.headers['x-klar-filename'] || 'file';
+  const safeName = sanitizeFilename(decodeURIComponent(String(rawName)));
+
+  // Buffer the body. We cap aggressively so a malicious client can't OOM us.
+  const chunks = [];
+  let total = 0;
+  let aborted = false;
+  await new Promise((resolve) => {
+    req.on('data', (c) => {
+      total += c.length;
+      if (total > MAX_UPLOAD_BYTES) {
+        aborted = true;
+        sendError(res, 413, `file too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB)`);
+        try { req.destroy(); } catch {}
+        return resolve();
+      }
+      chunks.push(c);
+    });
+    req.on('end', resolve);
+    req.on('error', resolve);
+  });
+  if (aborted) return;
+  if (!total) return sendError(res, 400, 'empty file');
+  const buf = Buffer.concat(chunks);
+
+  // Build multipart body for catbox.
+  const boundary = '----klar' + crypto.randomBytes(16).toString('hex');
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="reqtype"\r\n\r\n` +
+    `fileupload\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="fileToUpload"; filename="${safeName.replace(/"/g, '_')}"\r\n` +
+    `Content-Type: ${mime}\r\n\r\n`
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const body = Buffer.concat([head, buf, tail]);
+
+  let upstream;
+  try {
+    upstream = await fetch('https://catbox.moe/user/api.php', {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(body.length),
+        'User-Agent': 'klar/0.1 (+https://github.com/ThatsALotOfBees/Klar)',
+      },
+      body,
+    });
+  } catch (e) {
+    log.error('upload.catbox', 'network failure', { err: e.message, name: safeName });
+    return sendError(res, 502, 'catbox unreachable: ' + e.message);
+  }
+  const text = (await upstream.text()).trim();
+  if (!upstream.ok || !text.startsWith('https://files.catbox.moe/')) {
+    log.error('upload.catbox', 'rejected', { status: upstream.status, body: text.slice(0, 200), name: safeName });
+    return sendError(res, 502, 'catbox upload failed (' + upstream.status + '): ' + text.slice(0, 200));
+  }
+  log.info('upload.catbox', 'uploaded', { user: me.username, url: text, mime, bytes: total, name: safeName });
+  send(res, 200, { url: text, filename: safeName, mime, size: total });
+}
+
+// Tiny URL-allowlist so the embed resolver doesn't become a generic SSRF
+// proxy. Add hosts here as needed; we currently only need medal.tv. Other
+// hosts that publish og:video can be added freely.
+const EMBED_ALLOWED_HOSTS = new Set([
+  'medal.tv',
+  'www.medal.tv',
+]);
+
+// POST /api/embed/resolve — fetch a third-party URL and extract OpenGraph
+// video / thumbnail / title metadata. Used by the renderer to inline a
+// custom video player for sites like medal.tv that publish og:video.
+async function handleEmbedResolve(req, res) {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  let body;
+  try { body = await readJson(req); }
+  catch { return sendError(res, 400, 'invalid json'); }
+  const url = String(body && body.url || '');
+  let parsed;
+  try { parsed = new URL(url); }
+  catch { return sendError(res, 400, 'invalid url'); }
+  if (parsed.protocol !== 'https:') return sendError(res, 400, 'https only');
+  if (!EMBED_ALLOWED_HOSTS.has(parsed.hostname.toLowerCase())) {
+    return sendError(res, 403, 'host not allowlisted');
+  }
+
+  let upstream;
+  try {
+    upstream = await fetch(parsed.toString(), {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; klar-embed/0.1)',
+        'Accept': 'text/html,application/xhtml+xml',
+      },
+      redirect: 'follow',
+    });
+  } catch (e) {
+    return sendError(res, 502, 'fetch failed: ' + e.message);
+  }
+  if (!upstream.ok) return sendError(res, 502, 'upstream ' + upstream.status);
+  const html = (await upstream.text()).slice(0, 256 * 1024); // cap parse cost
+
+  const meta = (prop) => {
+    // Match meta tags with property="..." OR name="..." in either attribute order.
+    const re = new RegExp(`<meta\\s+(?:property|name)=["']${prop}["']\\s+content=["']([^"']+)["']|<meta\\s+content=["']([^"']+)["']\\s+(?:property|name)=["']${prop}["']`, 'i');
+    const m = html.match(re);
+    return m ? (m[1] || m[2]) : null;
+  };
+  const out = {
+    url: parsed.toString(),
+    videoUrl:  meta('og:video:secure_url') || meta('og:video:url') || meta('og:video') || null,
+    videoType: meta('og:video:type') || null,
+    thumbnail: meta('og:image:secure_url') || meta('og:image') || null,
+    title:     meta('og:title') || null,
+    site:      meta('og:site_name') || parsed.hostname,
+    width:     Number(meta('og:video:width'))  || null,
+    height:    Number(meta('og:video:height')) || null,
+  };
+  log.info('embed.resolve', 'ok', { user: me.username, host: parsed.hostname, hasVideo: !!out.videoUrl });
+  send(res, 200, out);
+}
+
 const routes = [];
 function route(method, pattern, handler) { routes.push({ method, pattern, handler }); }
 
@@ -939,16 +1073,32 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   }
   if (content.length > 4000) return sendError(res, 400, 'content too long');
 
-  // Validate attachment refs — they must point at uploads we own. Drop any
-  // bogus entries silently.
+  // Validate attachment refs:
+  //   - relative /uploads/<id>/<name> URLs must resolve to a known upload
+  //   - https://files.catbox.moe/* URLs are accepted at face value (the
+  //     upload went through our /api/uploads/catbox proxy which already
+  //     authenticated the user; the URL is publicly resolvable).
+  // Anything else is dropped silently to avoid letting clients smuggle
+  // arbitrary URLs into messages as "attachments".
   const attachments = [];
   for (const a of rawAtt.slice(0, 10)) {
     if (!a || typeof a.url !== 'string') continue;
     const m = a.url.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
-    if (!m) continue;
-    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m[1]);
-    if (!row) continue;
-    attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+    if (m) {
+      const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m[1]);
+      if (!row) continue;
+      attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+      continue;
+    }
+    if (/^https:\/\/files\.catbox\.moe\/[a-z0-9._-]+$/i.test(a.url)) {
+      attachments.push({
+        url: a.url,
+        name: typeof a.name === 'string' ? a.name.slice(0, 100) : a.url.split('/').pop(),
+        mime: typeof a.mime === 'string' ? a.mime.slice(0, 80) : 'application/octet-stream',
+        size: Number.isFinite(a.size) && a.size > 0 ? Math.min(a.size, 1_000_000_000) : 0,
+      });
+      continue;
+    }
   }
   const attJson = attachments.length ? JSON.stringify(attachments) : null;
 
@@ -1188,14 +1338,28 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   if (!content.trim() && rawAtt.length === 0) return sendError(res, 400, 'content or attachments required');
   if (content.length > 4000) return sendError(res, 400, 'content too long');
 
+  // Same validation rules as DM messages: local /uploads/<id>/<name> refs
+  // must resolve to a known upload; https://files.catbox.moe/* refs are
+  // accepted at face value (the proxy already authed the user).
   const attachments = [];
   for (const a of rawAtt.slice(0, 10)) {
     if (!a || typeof a.url !== 'string') continue;
     const m2 = a.url.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
-    if (!m2) continue;
-    const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m2[1]);
-    if (!row) continue;
-    attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+    if (m2) {
+      const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m2[1]);
+      if (!row) continue;
+      attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+      continue;
+    }
+    if (/^https:\/\/files\.catbox\.moe\/[a-z0-9._-]+$/i.test(a.url)) {
+      attachments.push({
+        url: a.url,
+        name: typeof a.name === 'string' ? a.name.slice(0, 100) : a.url.split('/').pop(),
+        mime: typeof a.mime === 'string' ? a.mime.slice(0, 80) : 'application/octet-stream',
+        size: Number.isFinite(a.size) && a.size > 0 ? Math.min(a.size, 1_000_000_000) : 0,
+      });
+      continue;
+    }
   }
   const attJson = attachments.length ? JSON.stringify(attachments) : null;
 
@@ -1287,6 +1451,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
     if (req.url === '/api/uploads' && req.method === 'POST') {
       return handleUpload(req, res);
+    }
+    if (req.url === '/api/uploads/catbox' && req.method === 'POST') {
+      return handleCatboxUpload(req, res);
+    }
+    if (req.url === '/api/embed/resolve' && req.method === 'POST') {
+      return handleEmbedResolve(req, res);
     }
     if (req.url.startsWith('/api/')) {
       const url = req.url.split('?')[0];

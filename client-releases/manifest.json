@@ -1,15 +1,15 @@
 {
-  "version": "0.1.20",
-  "releasedAt": "2026-05-07T15:41:51.931Z",
+  "version": "0.1.21",
+  "releasedAt": "2026-05-07T15:54:45.268Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",
-      "sha256": "19c6d6a57580c352fe79585c7fccbe82583f58fc058de58e516e270bec6da8fb"
+      "sha256": "23b30c4dea7a6d9b3ac2cf474d696ac7459ae93fc1bb465cfd2176ca22affed3"
     },
     {
       "path": "app.js",
-      "sha256": "de5cab6302e407aac495cc15a0cfb95f7269a67dcc2ddb05dbb086d5edbaad6d"
+      "sha256": "913be5cf6b3ed9d229c3afef31a3378bbd8491368cca34acc70ce4424b6ce648"
     },
     {
       "path": "index.html",
@@ -25,7 +25,7 @@
     },
     {
       "path": "styles.css",
-      "sha256": "de6d45b3307f3628db374058d7f524fcd2bbec216cd652173adb424fbcc6101c"
+      "sha256": "6557a5ef4be2bd50d99903da3f48ba7ab051d5612af8eb877fbe9269491cb1b6"
     }
   ],
   "notes": null
