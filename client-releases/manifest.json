@@ -1,6 +1,6 @@
 {
-  "version": "0.1.25",
-  "releasedAt": "2026-05-07T17:32:47.995Z",
+  "version": "0.1.26",
+  "releasedAt": "2026-05-07T17:50:31.119Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
@@ -9,7 +9,7 @@
     },
     {
       "path": "app.js",
-      "sha256": "0f1a3dc01917ba436b162c19be0f7593bc2392355c6d3517c7dec699c4c98604"
+      "sha256": "e701c65be1176d576c5c5fa28e7fcd664da4be0e9e8cb9bce0040e8cb64a3f87"
     },
     {
       "path": "index.html",
