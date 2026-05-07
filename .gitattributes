@@ -1,19 +1,27 @@
-# Force binary handling for the auto-update bundle. The manifest stores a
-# SHA256 hash of each file as it lives in client-releases/<version>/; git's
-# default CRLF conversion on Windows would rewrite line endings on commit
-# and produce a file on raw.githubusercontent.com that no longer matches
-# the recorded hash, breaking the auto-update integrity check at apply
-# time ("sha256 mismatch for app.js: expected ..., got ...").
+# gitattributes is "last-match wins" per attribute. Put the catch-all
+# default first; the binary overrides for client-releases/** + media
+# files MUST come after, otherwise the catch-all's eol=lf wins and
+# defeats the purpose.
+
+# Default: detect text files, store with LF in the index. Source files
+# in this repo are LF regardless of the user's autocrlf setting.
+* text=auto eol=lf
+
+# Auto-update bundle MUST be byte-exact end-to-end. release-client.cjs
+# computes a SHA256 of each snapshot file, the manifest stores it, and
+# the renderer verifies the same hash after downloading from
+# raw.githubusercontent.com. Any line-ending conversion between snapshot
+# and serving breaks the integrity check ("sha256 mismatch for app.js").
 client-releases/** -text
 
 # Sounds + media must never be touched.
 *.mp3 -text
 *.wav -text
 *.ogg -text
+*.mp4 -text
+*.webm -text
 *.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
 *.ico -text
-
-# Keep the rest of the repo as the user's git config dictates (autocrlf
-# usually true on Windows, false on macOS/Linux). Source files are written
-# with LF in this repo regardless.
-* text=auto eol=lf
