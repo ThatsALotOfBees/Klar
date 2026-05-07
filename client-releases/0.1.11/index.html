@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Klar &mdash; Deep Space Comms</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- Inline SVG icon symbols, referenced by app.js via <svg><use href="#klar-X"/></svg> -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="klar-asteroid" viewBox="0 0 32 32">
+        <path d="M9 5 L18 3 L26 8 L29 16 L25 24 L17 28 L7 26 L3 18 L4 10 Z"
+              fill="currentColor" stroke="currentColor" stroke-width="0.5" stroke-linejoin="round" />
+        <circle cx="11" cy="12" r="2" fill="rgba(0,0,0,0.35)" />
+        <circle cx="20" cy="18" r="1.4" fill="rgba(0,0,0,0.35)" />
+        <circle cx="14" cy="22" r="1" fill="rgba(0,0,0,0.3)" />
+        <circle cx="22" cy="10" r="0.8" fill="rgba(0,0,0,0.3)" />
+      </symbol>
+      <symbol id="klar-hash" viewBox="0 0 24 24">
+        <path d="M5 9h14M5 15h14M10 4l-2 16M16 4l-2 16"
+              fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-lock" viewBox="0 0 24 24">
+        <rect x="5" y="11" width="14" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+        <path d="M8 11V7a4 4 0 018 0v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+      </symbol>
+      <symbol id="klar-plus" viewBox="0 0 24 24">
+        <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-compass" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <path d="M16 8l-2 6-6 2 2-6z" fill="currentColor" fill-opacity="0.3" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+      </symbol>
+      <symbol id="klar-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path d="M20 20l-3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-send" viewBox="0 0 24 24">
+        <path d="M3 12l18-8-7 18-3-7-8-3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+      </symbol>
+      <symbol id="klar-menu" viewBox="0 0 24 24">
+        <path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-mic" viewBox="0 0 24 24">
+        <rect x="9" y="3" width="6" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <path d="M5 12a7 7 0 0014 0M12 19v3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-headphones" viewBox="0 0 24 24">
+        <path d="M4 14v-2a8 8 0 0116 0v2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        <rect x="3" y="13" width="4" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <rect x="17" y="13" width="4" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+      </symbol>
+      <symbol id="klar-settings" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"
+              fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+      </symbol>
+      <symbol id="klar-logout" viewBox="0 0 24 24">
+        <path d="M10 17l-5-5 5-5M5 12h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        <path d="M21 4v16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-user" viewBox="0 0 24 24">
+        <circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <path d="M4 21c0-4 4-7 8-7s8 3 8 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+      </symbol>
+      <symbol id="klar-users" viewBox="0 0 24 24">
+        <circle cx="9" cy="9" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6" />
+        <path d="M2.5 19c0-3 3-5 6.5-5s6.5 2 6.5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        <circle cx="17" cy="7.5" r="2.6" fill="none" stroke="currentColor" stroke-width="1.5" />
+        <path d="M15.5 14c2.5 0.2 5 1.7 5 4.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+      </symbol>
+
+      <!-- Broken cable / unplugged-network glyph for the "server unreachable" screen -->
+      <symbol id="klar-broken-cable" viewBox="0 0 120 64">
+        <!-- Left cable end (RJ-45 plug shape) -->
+        <rect x="3" y="22" width="38" height="20" rx="3" fill="rgba(157,109,255,0.15)" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+        <line x1="10" y1="22" x2="10" y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+        <line x1="16" y1="22" x2="16" y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+        <line x1="22" y1="22" x2="22" y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+        <!-- Left strands sticking out -->
+        <path d="M41 26 L48 23 M41 30 L48 30 M41 34 L48 36 M41 38 L48 40" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
+
+        <!-- Spark/break in the middle -->
+        <path d="M52 18 L56 28 L48 32 L60 38" stroke="#e85d75" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+        <circle cx="56" cy="14" r="1.5" fill="#e85d75" />
+        <circle cx="64" cy="44" r="1.2" fill="#e85d75" />
+        <circle cx="60" cy="22" r="0.8" fill="#e85d75" />
+
+        <!-- Right strands sticking out -->
+        <path d="M79 26 L72 23 M79 30 L72 30 M79 34 L72 36 M79 38 L72 40" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none" />
+        <!-- Right cable end -->
+        <rect x="79" y="22" width="38" height="20" rx="3" fill="rgba(157,109,255,0.15)" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+        <line x1="98"  y1="22" x2="98"  y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+        <line x1="104" y1="22" x2="104" y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+        <line x1="110" y1="22" x2="110" y2="42" stroke="currentColor" stroke-width="1" opacity="0.5" />
+      </symbol>
+    </defs>
+  </svg>
+
+  <!-- Desktop-app title bar. Hidden by default; app.js shows it only when
+       the Electron preload bridge (window.klar.shell) is present. -->
+  <div class="titlebar hidden" data-titlebar>
+    <div class="traffic-lights">
+      <button class="tl tl-close"      data-tl="close"      title="Close" tabindex="-1">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" stroke="rgba(0,0,0,0.65)" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+      <button class="tl tl-fullscreen" data-tl="fullscreen" title="Toggle fullscreen" tabindex="-1">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4 1H1v3M8 1h3v3M4 11H1V8M8 11h3V8" fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="tl tl-minimize"   data-tl="minimize"   title="Minimize" tabindex="-1">
+        <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 6h6" stroke="rgba(0,0,0,0.65)" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="titlebar-text" data-titlebar-text>Klar</div>
+    <div class="titlebar-spacer"></div>
+  </div>
+
+  <div id="app"></div>
+
+  <!-- ============================== Auth ============================== -->
+
+  <template id="tpl-auth">
+    <div class="auth-shell">
+      <div class="starfield"></div>
+      <div class="nebula-glow nebula-a"></div>
+      <div class="nebula-glow nebula-b"></div>
+
+      <div class="auth-card">
+        <h1 class="brand">
+          <svg class="brand-glyph" aria-hidden="true"><use href="#klar-asteroid"/></svg>Klar
+        </h1>
+        <p class="brand-tag">Open frequencies. Private DMs. Cosmic comms.</p>
+
+        <div class="tabs">
+          <button class="tab active" data-tab="login">Log in</button>
+          <button class="tab" data-tab="register">Sign up</button>
+        </div>
+
+        <form class="auth-form" data-form="login" autocomplete="off">
+          <label>Username<input name="klar_id" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore data-bwignore spellcheck="false" autocapitalize="off" autocorrect="off" required /></label>
+          <label>Password<input name="klar_secret" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore data-bwignore spellcheck="false" required /></label>
+          <label class="remember-row">
+            <input type="checkbox" name="remember" data-remember />
+            <span>Stay logged in on this browser</span>
+          </label>
+          <button type="submit">Log in</button>
+        </form>
+
+        <form class="auth-form hidden" data-form="register" autocomplete="off">
+          <label>Username<input name="klar_id" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore data-bwignore spellcheck="false" autocapitalize="off" autocorrect="off" required pattern="[A-Za-z0-9_.\-]{3,24}" title="3-24 chars, letters/digits/._-" /></label>
+          <label>Display name<input name="klar_display" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore data-bwignore spellcheck="false" /></label>
+          <label>Password<input name="klar_secret" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore data-bwignore spellcheck="false" required minlength="8" /></label>
+          <label class="remember-row">
+            <input type="checkbox" name="remember" data-remember />
+            <span>Stay logged in on this browser</span>
+          </label>
+          <button type="submit">Create account</button>
+        </form>
+
+        <div class="error" data-error hidden></div>
+      </div>
+    </div>
+  </template>
+
+  <!-- ============================== App shell ============================== -->
+
+  <template id="tpl-app">
+    <div class="app-shell" data-app-shell>
+      <div class="starfield" style="z-index:0"></div>
+      <div class="nebula-glow nebula-a"></div>
+      <div class="nebula-glow nebula-b"></div>
+
+      <!-- Server rail (left edge) -->
+      <nav class="server-rail" data-rail>
+        <div class="rail-slot active" data-action="select-home" data-label="Direct Messages">
+          <span class="pill"></span>
+          <span class="orbit-ring"></span>
+          <button class="rail-btn home"><svg width="28" height="28"><use href="#klar-asteroid"/></svg></button>
+        </div>
+        <div class="rail-divider"></div>
+        <div class="rail-server-list" data-server-list></div>
+        <div class="rail-slot" data-label="Add a server">
+          <button class="rail-btn action" data-action="create-server"><svg width="22" height="22"><use href="#klar-plus"/></svg></button>
+        </div>
+        <div class="rail-slot" data-label="Join with invite code">
+          <button class="rail-btn action explore" data-action="join-server"><svg width="22" height="22"><use href="#klar-compass"/></svg></button>
+        </div>
+      </nav>
+
+      <!-- Sidebar (DMs or channels) -->
+      <aside class="sidebar" data-sidebar></aside>
+
+      <!-- Chat -->
+      <main class="chat" data-chat>
+        <div class="chat-empty" data-chat-empty>
+          <h2>Welcome to Klar</h2>
+          <p>Open the asteroid for direct messages, or pick a server orb on the left.</p>
+        </div>
+        <div class="chat-active hidden" data-chat-active>
+          <header class="chat-header" data-chat-header></header>
+          <div class="messages" data-messages></div>
+          <form class="composer" data-composer>
+            <input type="text" placeholder="Transmit a message" data-composer-input autocomplete="off" />
+            <button type="submit" title="Transmit"><svg width="16" height="16"><use href="#klar-send"/></svg></button>
+          </form>
+          <div class="composer-status" data-composer-status></div>
+        </div>
+      </main>
+
+      <!-- Members (right edge, server view only) -->
+      <aside class="members hidden" data-members></aside>
+    </div>
+  </template>
+
+  <!-- ============================== Sidebars ============================== -->
+
+  <template id="tpl-sidebar-home">
+    <div class="sidebar-header">
+      <div class="sidebar-title">Direct Messages</div>
+    </div>
+    <div class="search">
+      <input type="search" placeholder="Find a pilot by username..." data-user-search />
+      <div class="search-results" data-search-results hidden></div>
+    </div>
+    <ul class="dm-list" data-dm-list></ul>
+    <div class="me-bar" data-me-bar></div>
+  </template>
+
+  <template id="tpl-sidebar-server">
+    <div class="sidebar-header">
+      <div>
+        <div class="sidebar-title" data-server-name></div>
+        <div class="sidebar-meta" data-server-tag>OPEN FREQUENCY</div>
+      </div>
+      <button class="icon-btn" data-action="server-menu" title="Server menu">
+        <svg width="16" height="16"><use href="#klar-menu"/></svg>
+      </button>
+    </div>
+    <ul class="channel-list" data-channel-list></ul>
+    <div class="me-bar" data-me-bar></div>
+  </template>
+
+  <!-- ============================== Modals ============================== -->
+
+  <template id="tpl-modal-create-server">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal">
+        <h2>Establish a server</h2>
+        <p>A space for your crew. You can rename or decommission it later.</p>
+        <form data-form="create-server">
+          <label>Server name<input name="name" required maxlength="60" autofocus /></label>
+          <div class="modal-actions">
+            <button type="button" class="ghost" data-action="cancel">Cancel</button>
+            <button type="submit">Create</button>
+          </div>
+        </form>
+        <div class="error" data-error hidden></div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-modal-join-server">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal">
+        <h2>Join a server</h2>
+        <p>Paste an invite code from someone whose orbit you want to share.</p>
+        <form data-form="join-server">
+          <label>Invite code<input name="code" required maxlength="32" autofocus pattern="[A-Za-z0-9]+" /></label>
+          <div class="modal-actions">
+            <button type="button" class="ghost" data-action="cancel">Cancel</button>
+            <button type="submit">Join</button>
+          </div>
+        </form>
+        <div class="error" data-error hidden></div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-modal-create-channel">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal">
+        <h2>New channel</h2>
+        <p>Channel names are lowercase, no spaces.</p>
+        <form data-form="create-channel">
+          <label>Channel name<input name="name" required pattern="[a-z0-9][a-z0-9_\-]*" maxlength="32" autofocus placeholder="general" /></label>
+          <div class="modal-actions">
+            <button type="button" class="ghost" data-action="cancel">Cancel</button>
+            <button type="submit">Create</button>
+          </div>
+        </form>
+        <div class="error" data-error hidden></div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-modal-invite">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal">
+        <h2>Beam an invite</h2>
+        <p>Share this code so others can sync up with your server.</p>
+        <div class="invite-code" data-invite-code>...</div>
+        <div class="modal-actions">
+          <button type="button" data-action="copy-invite">Copy</button>
+          <button type="button" class="ghost" data-action="cancel">Done</button>
+        </div>
+        <div class="muted" data-invite-status style="margin-top:10px"></div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-modal-profile">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal profile-modal">
+        <div class="profile-banner"></div>
+        <div class="profile-avatar"><div class="avatar"></div></div>
+        <h2 class="profile-name" data-profile-name></h2>
+        <div class="profile-handle muted" data-profile-handle></div>
+        <div class="profile-fields">
+          <div class="profile-field">
+            <span class="label">User ID</span>
+            <code class="value" data-profile-id></code>
+          </div>
+          <div class="profile-field">
+            <span class="label">Joined</span>
+            <span class="value" data-profile-joined>—</span>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-action="cancel">Close</button>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-modal-server-menu">
+    <div class="modal-backdrop" data-modal>
+      <div class="modal">
+        <h2 data-server-name></h2>
+        <div class="server-menu-actions">
+          <button data-action="create-channel">+ New channel</button>
+          <button data-action="invite">Beam an invite</button>
+          <button class="danger" data-action="leave">Leave server</button>
+          <button class="danger" data-action="delete" hidden>Decommission server</button>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-action="cancel">Close</button>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

@@ -12,6 +12,10 @@ $Global:KlarTunnelLogFile  = Join-Path $KlarRoot 'klar.tunnel.log'
 $Global:KlarTunnelErrFile  = Join-Path $KlarRoot 'klar.tunnel.err.log'
 $Global:KlarTunnelPidFile  = Join-Path $KlarRoot '.klar.tunnel.pid'
 $Global:KlarConfigFile     = Join-Path $KlarRoot 'client-config.json'
+$Global:KlarCaddyfile      = Join-Path $KlarRoot 'Caddyfile'
+$Global:KlarCaddyLogFile   = Join-Path $KlarRoot 'klar.caddy.log'
+$Global:KlarCaddyErrFile   = Join-Path $KlarRoot 'klar.caddy.err.log'
+$Global:KlarCaddyPidFile   = Join-Path $KlarRoot '.klar.caddy.pid'
 
 Set-Location $KlarRoot
 
@@ -90,7 +94,11 @@ function Klar-Help {
         ,@('app',        'Launch the Electron desktop app (frameless window)')
         ,@('dist',       'Build a portable .exe of the desktop app (slow first time)')
         ,@('release-client [v]', 'Snapshot public/ as a new entry in client-releases/')
-        ,@('tunnel [-Subdomain]', 'Open a public *.loca.lt URL pointing at the local server (for cross-network testing)')
+        ,@('tunnel [-Subdomain]', 'Open a public *.loca.lt URL (legacy localtunnel — flaky)')
+        ,@('funnel [-Off]', 'Open Tailscale Funnel: stable *.ts.net URL')
+        ,@('caddy-up',   'Start Caddy reverse proxy on 80/443 (needs admin) for the custom domain')
+        ,@('caddy-down', 'Stop the Caddy reverse proxy')
+        ,@('caddy-tail', 'Follow caddy live log (cert provisioning, requests)')
     )
     foreach ($r in $rows) {
         Write-Host ("  {0,-22}" -f $r[0]) -NoNewline -ForegroundColor Green
@@ -510,6 +518,248 @@ function Invoke-KlarTunnel {
     }
 }
 Set-Alias tunnel Invoke-KlarTunnel -Scope Global
+
+# Locate the tailscale CLI. On Windows it's installed under Program Files but
+# isn't always on PATH (the installer adds it but only after a new shell).
+function Get-KlarTailscaleExe {
+    $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($p in @(
+        "$env:ProgramFiles\Tailscale\tailscale.exe",
+        "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+    )) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+function Invoke-KlarFunnel {
+    [CmdletBinding()]
+    param(
+        [switch]$Off,
+        [switch]$NoStart
+    )
+
+    $ts = Get-KlarTailscaleExe
+    if (-not $ts) {
+        Write-Host ""
+        Write-Host "  Tailscale isn't installed yet." -ForegroundColor Yellow
+        Write-Host "  One-time setup (free for personal use, no domain required):" -ForegroundColor Gray
+        Write-Host "    1. Install:  https://tailscale.com/download/windows" -ForegroundColor Cyan
+        Write-Host "       (sign in with Google / GitHub / Microsoft when it asks)" -ForegroundColor DarkGray
+        Write-Host "    2. Enable HTTPS + Funnel for your tailnet:" -ForegroundColor Cyan
+        Write-Host "         https://login.tailscale.com/admin/dns         (turn on MagicDNS + HTTPS)" -ForegroundColor DarkGray
+        Write-Host "         https://login.tailscale.com/admin/acls        (add a 'funnel' grant; default config below)" -ForegroundColor DarkGray
+        Write-Host "    3. Re-run 'funnel' in this shell." -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  Minimum ACL grant for funnel (paste into the ACL editor):" -ForegroundColor DarkGray
+        Write-Host '    "nodeAttrs": [ { "target": ["*"], "attr": ["funnel"] } ]' -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+
+    if ($Off) {
+        Write-Host "Disabling Tailscale Funnel..." -ForegroundColor Cyan
+        & $ts funnel reset
+        if ($LASTEXITCODE -eq 0) { Write-Host "Funnel disabled." -ForegroundColor Green }
+        return
+    }
+
+    # Make sure the local server is up first - otherwise the funnel URL would
+    # 502 the same way localtunnel does when nothing is listening.
+    if (-not $NoStart) {
+        $serverPid = Get-KlarPid
+        if (-not $serverPid) {
+            Write-Host "No local server running on port $($Global:KlarPort). Starting (without localtunnel)..." -ForegroundColor Cyan
+            Start-KlarBackground -NoTunnel
+            Start-Sleep -Milliseconds 800
+            if (-not (Get-KlarPid)) {
+                Write-Host "Server didn't start cleanly. Check logs and retry." -ForegroundColor Red
+                return
+            }
+        } else {
+            Write-Host "Local server already running on port $($Global:KlarPort) (pid $serverPid)." -ForegroundColor DarkGray
+        }
+    }
+
+    # Read the device's MagicDNS name. Self.DNSName is the canonical FQDN
+    # (trailing dot included), e.g. "klar-host.tail-scale.ts.net."
+    $statusRaw = & $ts status --json 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $statusRaw) {
+        Write-Host "tailscale status failed. Are you signed in? Try: tailscale login" -ForegroundColor Red
+        if ($statusRaw) { Write-Host $statusRaw -ForegroundColor DarkGray }
+        return
+    }
+    try {
+        $status = ($statusRaw -join "`n") | ConvertFrom-Json
+    } catch {
+        Write-Host "Couldn't parse tailscale status output." -ForegroundColor Red
+        return
+    }
+    $dnsName = ''
+    if ($status.Self -and $status.Self.DNSName) { $dnsName = ([string]$status.Self.DNSName).TrimEnd('.') }
+    if (-not $dnsName) {
+        Write-Host "Couldn't read Self.DNSName from tailscale status. Make sure MagicDNS is enabled at https://login.tailscale.com/admin/dns" -ForegroundColor Yellow
+        return
+    }
+
+    # Open the tunnel. --bg returns immediately and leaves the rule in place
+    # so closing this shell doesn't take the URL down.
+    Write-Host "Opening Tailscale Funnel  https://$dnsName  ->  localhost:$($Global:KlarPort) ..." -ForegroundColor Cyan
+    $funnelOut = & $ts funnel --bg "$($Global:KlarPort)" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "tailscale funnel failed (exit $LASTEXITCODE). Output:" -ForegroundColor Red
+        $funnelOut | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        Write-Host "" -ForegroundColor Gray
+        Write-Host "If the error mentions Funnel/HTTPS not being enabled, fix it here:" -ForegroundColor Yellow
+        Write-Host "  https://login.tailscale.com/admin/dns                 (enable HTTPS Certificates)" -ForegroundColor DarkGray
+        Write-Host "  https://login.tailscale.com/admin/acls                (grant funnel attr - see 'funnel' help)" -ForegroundColor DarkGray
+        return
+    }
+    if ($funnelOut) { $funnelOut | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray } }
+
+    $url = "https://$dnsName"
+    Write-Host ""
+    Write-Host "  Klar funnel up:  $url" -ForegroundColor Green
+    Write-Host "  This URL is stable - it doesn't change between restarts." -ForegroundColor DarkGray
+    Write-Host "  To take it down later:  funnel -Off" -ForegroundColor DarkGray
+    Write-Host ""
+    Publish-KlarServerUrl -Url $url
+}
+Set-Alias funnel Invoke-KlarFunnel -Scope Global
+
+# ---- Caddy reverse proxy (HTTPS termination for the public domain) ------
+
+function Get-KlarCaddyExe {
+    $cmd = Get-Command caddy -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    # winget installs Caddy under the per-user package dir on first install;
+    # PATH only picks it up after a new shell launches.
+    $globs = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\CaddyServer.Caddy_*\caddy.exe",
+        "$env:ProgramFiles\Caddy\caddy.exe",
+        "${env:ProgramFiles(x86)}\Caddy\caddy.exe"
+    )
+    foreach ($g in $globs) {
+        $hit = Get-ChildItem -Path $g -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+function Get-KlarCaddyPid {
+    if (-not (Test-Path $Global:KlarCaddyPidFile)) { return $null }
+    $raw = Get-Content $Global:KlarCaddyPidFile -ErrorAction SilentlyContinue
+    if (-not $raw) { return $null }
+    $procPid = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$procPid)) {
+        Remove-Item $Global:KlarCaddyPidFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    $proc = Get-Process -Id $procPid -ErrorAction SilentlyContinue
+    if ($proc -and $proc.ProcessName -match 'caddy') { return $procPid }
+    Remove-Item $Global:KlarCaddyPidFile -Force -ErrorAction SilentlyContinue
+    return $null
+}
+
+function Test-KlarIsAdmin {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = [System.Security.Principal.WindowsPrincipal]::new($id)
+    return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Invoke-KlarCaddyUp {
+    [CmdletBinding()]
+    param([switch]$NoStart)
+
+    $caddy = Get-KlarCaddyExe
+    if (-not $caddy) {
+        Write-Host "Caddy not installed. Run: winget install CaddyServer.Caddy" -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-Path $Global:KlarCaddyfile)) {
+        Write-Host "Caddyfile missing at $Global:KlarCaddyfile" -ForegroundColor Yellow
+        return
+    }
+    if (Get-KlarCaddyPid) {
+        Write-Host "Caddy already running. Use 'caddy-down' to stop." -ForegroundColor Yellow
+        return
+    }
+    if (-not (Test-KlarIsAdmin)) {
+        Write-Host ""
+        Write-Host "  Caddy needs Administrator to bind ports 80 + 443." -ForegroundColor Yellow
+        Write-Host "  Quick fix:" -ForegroundColor Gray
+        Write-Host "    1. Open PowerShell as Administrator." -ForegroundColor DarkGray
+        Write-Host "    2. cd $KlarRoot" -ForegroundColor DarkGray
+        Write-Host "    3. . .\shell.ps1" -ForegroundColor DarkGray
+        Write-Host "    4. caddy-up" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Or run this one-liner from an elevated shell:" -ForegroundColor DarkGray
+        Write-Host "    & '$caddy' run --config '$Global:KlarCaddyfile'" -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+
+    # Make sure the local server is up first (Caddy proxying to nothing
+    # would 502 the same way localtunnel did).
+    if (-not $NoStart) {
+        if (-not (Get-KlarPid)) {
+            Write-Host "Local server not running. Starting (without localtunnel)..." -ForegroundColor Cyan
+            Start-KlarBackground -NoTunnel
+            Start-Sleep -Milliseconds 800
+            if (-not (Get-KlarPid)) { Write-Host "Server failed to start." -ForegroundColor Red; return }
+        }
+    }
+
+    if (Test-Path $Global:KlarCaddyLogFile) { Remove-Item $Global:KlarCaddyLogFile -Force }
+    if (Test-Path $Global:KlarCaddyErrFile) { Remove-Item $Global:KlarCaddyErrFile -Force }
+
+    $proc = Start-Process $caddy `
+        -ArgumentList @('run', '--config', $Global:KlarCaddyfile, '--adapter', 'caddyfile') `
+        -WorkingDirectory $KlarRoot `
+        -RedirectStandardOutput $Global:KlarCaddyLogFile `
+        -RedirectStandardError  $Global:KlarCaddyErrFile `
+        -WindowStyle Hidden `
+        -PassThru
+    "$($proc.Id)" | Set-Content -Path $Global:KlarCaddyPidFile -Encoding ascii
+    Start-Sleep -Milliseconds 1500
+    if (-not (Get-KlarCaddyPid)) {
+        Write-Host "Caddy failed to start. Last error log:" -ForegroundColor Red
+        if (Test-Path $Global:KlarCaddyErrFile) { Get-Content $Global:KlarCaddyErrFile -Tail 30 }
+        if (Test-Path $Global:KlarCaddyLogFile) { Get-Content $Global:KlarCaddyLogFile -Tail 30 }
+        return
+    }
+    Write-Host "Caddy started (pid $($proc.Id))." -ForegroundColor Green
+    Write-Host "  Public URL: https://thatsalotofbees.online" -ForegroundColor Cyan
+    Write-Host "  First-run cert provisioning takes ~30s. Watch with: caddy-tail" -ForegroundColor DarkGray
+}
+Set-Alias caddy-up Invoke-KlarCaddyUp -Scope Global
+
+function Stop-KlarCaddy {
+    $caddyPid = Get-KlarCaddyPid
+    if (-not $caddyPid) {
+        Write-Host "Caddy not running." -ForegroundColor DarkGray
+        return
+    }
+    try {
+        Stop-Process -Id $caddyPid -Force -ErrorAction Stop
+        Write-Host "Stopped Caddy (pid $caddyPid)." -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to stop Caddy: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Remove-Item $Global:KlarCaddyPidFile -Force -ErrorAction SilentlyContinue
+}
+Set-Alias caddy-down Stop-KlarCaddy -Scope Global
+
+function Watch-KlarCaddyLog {
+    if (-not (Test-Path $Global:KlarCaddyLogFile)) {
+        Write-Host "No Caddy log yet - run 'caddy-up' first." -ForegroundColor DarkGray
+        return
+    }
+    Write-Host "Following $Global:KlarCaddyLogFile  (Ctrl+C to stop)" -ForegroundColor Cyan
+    Get-Content $Global:KlarCaddyLogFile -Wait -Tail 50
+}
+Set-Alias caddy-tail Watch-KlarCaddyLog -Scope Global
 
 function Invoke-KlarReleaseClient {
     [CmdletBinding()]

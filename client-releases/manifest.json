@@ -1,7 +1,7 @@
 {
-  "version": "0.1.10",
-  "releasedAt": "2026-05-07T01:02:48.469Z",
-  "serverUrl": "https://klar-thatsalotofbees.loca.lt",
+  "version": "0.1.11",
+  "releasedAt": "2026-05-07T01:26:27.479Z",
+  "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",

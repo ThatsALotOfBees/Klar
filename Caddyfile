@@ -1,0 +1,40 @@
+# Caddyfile for Klar — terminates HTTPS on the public-facing domain and
+# reverse-proxies everything (including the /ws WebSocket upgrade) to the
+# local Klar Node server on :3000.
+#
+# Caddy auto-fetches a Let's Encrypt cert for thatsalotofbees.online the
+# first time it starts. Requirements:
+#   - DNS A record for thatsalotofbees.online points at this machine's
+#     public IP (currently 87.215.222.184).
+#   - Router forwards external 80/tcp + 443/tcp -> this machine.
+#   - This file is reachable to the caddy.exe process (run from this dir).
+#
+# Bring it up:
+#   admin powershell:  caddy run --config Caddyfile
+#   or in this shell:  caddy-up
+# Bring it down:        caddy-down
+
+# Email is used by Let's Encrypt for cert renewal notifications.
+{
+	email albertinosilva65@gmail.com
+}
+
+thatsalotofbees.online, www.thatsalotofbees.online {
+	# Reverse-proxy to the Klar Node server. reverse_proxy upgrades the
+	# /ws connection to a WebSocket automatically — no special directive
+	# needed, Caddy handles Upgrade/Connection headers transparently.
+	# header_up sets a header on the request *to* the upstream so server.js
+	# can log the real client IP instead of 127.0.0.1.
+	reverse_proxy localhost:3000 {
+		header_up X-Real-IP {remote_host}
+	}
+
+	# Compact access log; Klar's own structured logger covers the app side.
+	log {
+		output file caddy.access.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+		format console
+	}
+}
