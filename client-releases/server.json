@@ -1,6 +1,6 @@
-{
-  "_comment": "Live tunnel URL for the Klar host machine. The dev-shell `up` command auto-rewrites this on every URL change and pushes to GitHub. Installed clients fetch this file on boot via the discoverServerUrl() flow, so they always know where to connect even if the host's subdomain changes session-to-session. Don't hand-edit while the host is online; your edits will be overwritten by the next `up`.",
-  "serverUrl": "https://klar-thatsalotofbees.loca.lt",
-  "updatedAt": "2026-05-07T00:00:00.000Z",
-  "host": "ThatsALotOfBees"
+﻿{
+    "_comment":  "Live tunnel URL for the Klar host machine. The dev-shell `up` command auto-rewrites this on every URL change and pushes to GitHub. Installed clients fetch this file on boot via the discoverServerUrl() flow, so they always know where to connect even if the host\u0027s subdomain changes session-to-session. Don\u0027t hand-edit while the host is online; your edits will be overwritten by the next `up`.",
+    "serverUrl":  "https://slippery-wombat-59.loca.lt",
+    "updatedAt":  "2026-05-07T00:46:18.324Z",
+    "host":  "ThatsALotOfBees"
 }
