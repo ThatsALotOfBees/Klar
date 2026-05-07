@@ -188,6 +188,42 @@ CREATE TABLE IF NOT EXISTS blocks (
   FOREIGN KEY (blocked_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
+
+-- Group DMs (separate from 1:1 dms so existing logic stays untouched).
+-- members are tracked in group_chat_members. Group messages live in the
+-- existing messages table via the new group_chat_id column.
+CREATE TABLE IF NOT EXISTS group_chats (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  owner_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS group_chat_members (
+  chat_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  joined_at INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, user_id),
+  FOREIGN KEY (chat_id) REFERENCES group_chats(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_gchat_members_user ON group_chat_members(user_id);
+
+-- Group-chat messages live in their own table to avoid making the
+-- existing messages.dm_id column nullable (SQLite ALTER TABLE does not
+-- let us drop NOT NULL without recreating). Schema mirrors the
+-- messages table minus the legacy E2EE columns.
+CREATE TABLE IF NOT EXISTS group_chat_messages (
+  id TEXT PRIMARY KEY,
+  chat_id TEXT NOT NULL,
+  sender_id TEXT NOT NULL,
+  content TEXT,
+  created_at INTEGER NOT NULL,
+  attachments TEXT,
+  FOREIGN KEY (chat_id) REFERENCES group_chats(id) ON DELETE CASCADE,
+  FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_gchat_messages_chat ON group_chat_messages(chat_id, created_at);
 `);
 
 // SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — we have to feature-
@@ -202,8 +238,12 @@ function addColumnIfMissing(table, column, decl) {
 }
 addColumnIfMissing('messages',         'attachments', 'TEXT');
 addColumnIfMissing('channel_messages', 'attachments', 'TEXT');
-// 'text' | 'announcement' (voice channels are a separate feature TBD).
-// Announcement channels: only the server owner can post.
+// Group DM messages reuse the messages table — make dm_id nullable and
+// add a sibling group_chat_id column. Constrained at write-time so
+// exactly one is set.
+addColumnIfMissing('messages',         'group_chat_id', 'TEXT');
+// 'text' | 'announcement' | 'voice'. Voice channels are persistent
+// rooms — joining = entering a mesh call scoped to the channel.
 addColumnIfMissing('channels',         'kind',        "TEXT NOT NULL DEFAULT 'text'");
 
 db.exec(`
@@ -308,7 +348,8 @@ function dmRow(d) {
 function messageRow(m) {
   return {
     id: m.id,
-    dmId: m.dm_id,
+    dmId: m.dm_id || null,
+    groupChatId: m.group_chat_id || null,
     senderId: m.sender_id,
     content: m.content,
     nonce: m.nonce,
@@ -316,6 +357,32 @@ function messageRow(m) {
     createdAt: m.created_at,
     attachments: parseAttachments(m.attachments),
   };
+}
+
+// ---- Group chats ----
+function groupChatRow(g) {
+  if (!g) return null;
+  return { id: g.id, name: g.name || '', ownerId: g.owner_id, createdAt: g.created_at };
+}
+function isGroupChatMember(userId, chatId) {
+  return !!db.prepare('SELECT 1 FROM group_chat_members WHERE chat_id = ? AND user_id = ?').get(chatId, userId);
+}
+function groupChatMembers(chatId) {
+  return db.prepare(`
+    SELECT u.* FROM users u
+    JOIN group_chat_members m ON m.user_id = u.id
+    WHERE m.chat_id = ?
+    ORDER BY u.display_name ASC
+  `).all(chatId);
+}
+function broadcastToGroupChat(chatId, payload) {
+  const members = db.prepare('SELECT user_id FROM group_chat_members WHERE chat_id = ?').all(chatId);
+  const msg = JSON.stringify(payload);
+  for (const { user_id } of members) {
+    const set = sockets.get(user_id);
+    if (!set) continue;
+    for (const ws of set) if (ws.readyState === ws.OPEN) ws.send(msg);
+  }
 }
 
 function parseAttachments(raw) {
@@ -357,6 +424,53 @@ function otherUserId(user, dm) {
 }
 
 const sockets = new Map();
+
+// In-memory mesh-room state. roomId can be:
+//   - a call UUID (group call session — ephemeral, dies with last leaver)
+//   - a voice channel id (persistent room scoped to the channel)
+// Each room is just a Set<userId> currently inside it. When a user's WS
+// closes we sweep them out of every room they were in.
+const rooms = new Map(); // roomId -> Set<userId>
+const userRooms = new Map(); // userId -> Set<roomId>
+
+function joinRoom(roomId, userId) {
+  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+  rooms.get(roomId).add(userId);
+  if (!userRooms.has(userId)) userRooms.set(userId, new Set());
+  userRooms.get(userId).add(roomId);
+}
+function leaveRoom(roomId, userId) {
+  const r = rooms.get(roomId);
+  if (r) {
+    r.delete(userId);
+    if (r.size === 0) rooms.delete(roomId);
+  }
+  const u = userRooms.get(userId);
+  if (u) { u.delete(roomId); if (u.size === 0) userRooms.delete(userId); }
+}
+function roomMembers(roomId) {
+  const r = rooms.get(roomId);
+  return r ? Array.from(r) : [];
+}
+function userIsInRoom(userId, roomId) {
+  const u = userRooms.get(userId);
+  return !!(u && u.has(roomId));
+}
+function sweepUserFromRooms(userId) {
+  const u = userRooms.get(userId);
+  if (!u) return [];
+  const swept = Array.from(u);
+  for (const roomId of swept) {
+    const r = rooms.get(roomId);
+    if (r) {
+      r.delete(userId);
+      if (r.size === 0) rooms.delete(roomId);
+    }
+  }
+  userRooms.delete(userId);
+  return swept;
+}
+
 function broadcastToUser(userId, payload) {
   const set = sockets.get(userId);
   if (!set) return;
@@ -384,7 +498,7 @@ function publicServer(s) {
 }
 function channelRow(c) {
   if (!c) return null;
-  return {
+  const out = {
     id: c.id,
     serverId: c.server_id,
     name: c.name,
@@ -392,6 +506,13 @@ function channelRow(c) {
     position: c.position,
     createdAt: c.created_at,
   };
+  if (out.kind === 'voice') {
+    // Voice channels show live presence in the sidebar. The room id IS
+    // the channel id (room.join with that id puts you in this channel's
+    // mesh).
+    out.voiceMembers = roomMembers(c.id);
+  }
+  return out;
 }
 
 // Block lookups. blocks(blocker_id, blocked_id) — directional. We treat
@@ -1172,6 +1293,227 @@ route('GET', /^\/api\/dms\/([a-f0-9]+)\/archive$/, async (req, res, [, dmId]) =>
   send(res, 200, { folder: path.relative(__dirname, folder), files });
 });
 
+// ---------------- Group chats (multi-party DMs) ----------------
+
+route('GET', /^\/api\/group-chats$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const rows = db.prepare(`
+    SELECT g.*, m.last_at FROM group_chats g
+    JOIN group_chat_members me ON me.chat_id = g.id AND me.user_id = ?
+    LEFT JOIN (SELECT chat_id, MAX(created_at) AS last_at FROM group_chat_messages GROUP BY chat_id) m
+      ON m.chat_id = g.id
+    ORDER BY COALESCE(m.last_at, g.created_at) DESC
+  `).all(me.id);
+  const out = rows.map((g) => ({
+    ...groupChatRow(g),
+    members: groupChatMembers(g.id).map(publicUser),
+    lastAt: g.last_at || g.created_at,
+  }));
+  send(res, 200, { groupChats: out });
+});
+
+route('POST', /^\/api\/group-chats$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const body = await readJson(req);
+  const name = (body.name || '').toString().trim().slice(0, 60);
+  const memberIds = Array.isArray(body.memberIds) ? body.memberIds.slice(0, 24) : [];
+  if (!memberIds.length) return sendError(res, 400, 'at least one other member required');
+  // Validate every member id resolves to a real user.
+  const validMembers = [];
+  for (const id of memberIds) {
+    if (id === me.id) continue;
+    const u = db.prepare('SELECT id FROM users WHERE id = ?').get(id);
+    if (u) validMembers.push(id);
+  }
+  if (!validMembers.length) return sendError(res, 400, 'no valid members');
+  const id = newId();
+  const now = Date.now();
+  db.prepare('INSERT INTO group_chats (id, name, owner_id, created_at) VALUES (?,?,?,?)').run(id, name, me.id, now);
+  db.prepare('INSERT INTO group_chat_members (chat_id, user_id, joined_at) VALUES (?,?,?)').run(id, me.id, now);
+  for (const mid of validMembers) {
+    db.prepare('INSERT INTO group_chat_members (chat_id, user_id, joined_at) VALUES (?,?,?)').run(id, mid, now);
+  }
+  const row = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(id);
+  log.info('gchat.create', 'created', { chat: id, owner: me.username, members: validMembers.length + 1 });
+  // Notify all members so their sidebars update in real time.
+  const payload = {
+    type: 'group_chat_created',
+    chat: { ...groupChatRow(row), members: groupChatMembers(id).map(publicUser), lastAt: now },
+  };
+  broadcastToGroupChat(id, payload);
+  send(res, 200, payload.chat);
+});
+
+route('GET', /^\/api\/group-chats\/([a-f0-9]+)$/, async (req, res, [, chatId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const row = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(chatId);
+  if (!row) return sendError(res, 404, 'group chat not found');
+  send(res, 200, {
+    ...groupChatRow(row),
+    members: groupChatMembers(chatId).map(publicUser),
+  });
+});
+
+route('PATCH', /^\/api\/group-chats\/([a-f0-9]+)$/, async (req, res, [, chatId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const body = await readJson(req);
+  const updates = []; const args = [];
+  if (typeof body.name === 'string') {
+    updates.push('name = ?'); args.push(body.name.trim().slice(0, 60));
+  }
+  if (!updates.length) return sendError(res, 400, 'no updatable fields');
+  args.push(chatId);
+  db.prepare(`UPDATE group_chats SET ${updates.join(', ')} WHERE id = ?`).run(...args);
+  const row = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(chatId);
+  broadcastToGroupChat(chatId, {
+    type: 'group_chat_updated',
+    chat: { ...groupChatRow(row), members: groupChatMembers(chatId).map(publicUser) },
+  });
+  send(res, 200, groupChatRow(row));
+});
+
+route('POST', /^\/api\/group-chats\/([a-f0-9]+)\/members$/, async (req, res, [, chatId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const body = await readJson(req);
+  const userIds = Array.isArray(body.userIds) ? body.userIds.slice(0, 24) : [];
+  if (!userIds.length) return sendError(res, 400, 'userIds required');
+  const now = Date.now();
+  let added = 0;
+  for (const uid of userIds) {
+    const u = db.prepare('SELECT id FROM users WHERE id = ?').get(uid);
+    if (!u) continue;
+    const existing = db.prepare('SELECT 1 FROM group_chat_members WHERE chat_id = ? AND user_id = ?').get(chatId, uid);
+    if (existing) continue;
+    db.prepare('INSERT INTO group_chat_members (chat_id, user_id, joined_at) VALUES (?,?,?)').run(chatId, uid, now);
+    added++;
+  }
+  const row = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(chatId);
+  broadcastToGroupChat(chatId, {
+    type: 'group_chat_updated',
+    chat: { ...groupChatRow(row), members: groupChatMembers(chatId).map(publicUser) },
+  });
+  log.info('gchat.members.add', 'added', { chat: chatId, by: me.username, n: added });
+  send(res, 200, { added });
+});
+
+route('DELETE', /^\/api\/group-chats\/([a-f0-9]+)\/members\/([a-f0-9]+)$/, async (req, res, [, chatId, userId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  // You can remove yourself; otherwise only the owner can kick.
+  const chat = db.prepare('SELECT * FROM group_chats WHERE id = ?').get(chatId);
+  if (!chat) return sendError(res, 404, 'group chat not found');
+  if (userId !== me.id && chat.owner_id !== me.id) return sendError(res, 403, 'only the owner can remove members');
+  db.prepare('DELETE FROM group_chat_members WHERE chat_id = ? AND user_id = ?').run(chatId, userId);
+  // If we just removed the last member, kill the chat entirely.
+  const remaining = db.prepare('SELECT COUNT(*) AS n FROM group_chat_members WHERE chat_id = ?').get(chatId).n;
+  if (remaining === 0) {
+    db.prepare('DELETE FROM group_chats WHERE id = ?').run(chatId);
+    log.info('gchat.delete', 'last member left', { chat: chatId });
+  } else {
+    broadcastToGroupChat(chatId, {
+      type: 'group_chat_updated',
+      chat: { ...groupChatRow(chat), members: groupChatMembers(chatId).map(publicUser) },
+    });
+  }
+  // Tell the removed user too so their sidebar drops the chat.
+  broadcastToUser(userId, { type: 'group_chat_left', chatId });
+  log.info('gchat.members.remove', 'removed', { chat: chatId, target: userId.slice(0,8), by: me.username });
+  send(res, 200, { ok: true });
+});
+
+function groupChatMessageRow(m) {
+  if (!m) return null;
+  return {
+    id: m.id,
+    groupChatId: m.chat_id,
+    senderId: m.sender_id,
+    content: m.content,
+    createdAt: m.created_at,
+    attachments: parseAttachments(m.attachments),
+    encrypted: false,
+    nonce: null,
+  };
+}
+
+route('GET', /^\/api\/group-chats\/([a-f0-9]+)\/messages$/, async (req, res, [, chatId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const url = new URL(req.url, 'http://x');
+  const before = Number(url.searchParams.get('before')) || Date.now() + 1;
+  const limit = Math.min(Number(url.searchParams.get('limit')) || 1000, 5000);
+  const rows = db.prepare(`SELECT * FROM group_chat_messages WHERE chat_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`)
+    .all(chatId, before, limit);
+  send(res, 200, { messages: rows.reverse().map(groupChatMessageRow) });
+});
+
+route('POST', /^\/api\/group-chats\/([a-f0-9]+)\/messages$/, async (req, res, [, chatId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const body = await readJson(req);
+  const content = body.content || '';
+  const rawAtt = Array.isArray(body.attachments) ? body.attachments : [];
+  if ((typeof content !== 'string' || !content.trim()) && rawAtt.length === 0) {
+    return sendError(res, 400, 'content or attachments required');
+  }
+  if (content.length > 4000) return sendError(res, 400, 'content too long');
+  // Validate attachments same as DM messages.
+  const attachments = [];
+  for (const a of rawAtt.slice(0, 10)) {
+    if (!a || typeof a.url !== 'string') continue;
+    const m = a.url.match(/^\/uploads\/([a-f0-9]{8,})\/([^/]+)$/);
+    if (m) {
+      const row = db.prepare('SELECT * FROM uploads WHERE id = ?').get(m[1]);
+      if (!row) continue;
+      attachments.push({ url: a.url, name: row.filename, mime: row.mime, size: row.size });
+      continue;
+    }
+    if (/^https:\/\/files\.catbox\.moe\/[a-z0-9._-]+$/i.test(a.url)) {
+      attachments.push({
+        url: a.url,
+        name: typeof a.name === 'string' ? a.name.slice(0, 100) : a.url.split('/').pop(),
+        mime: typeof a.mime === 'string' ? a.mime.slice(0, 80) : 'application/octet-stream',
+        size: Number.isFinite(a.size) && a.size > 0 ? Math.min(a.size, 1_000_000_000) : 0,
+      });
+    }
+  }
+  const attJson = attachments.length ? JSON.stringify(attachments) : null;
+  const clientId = (typeof body.clientId === 'string' && body.clientId.length <= 64) ? body.clientId : null;
+  const id = newId();
+  const createdAt = Date.now();
+  db.prepare('INSERT INTO group_chat_messages (id, chat_id, sender_id, content, created_at, attachments) VALUES (?,?,?,?,?,?)')
+    .run(id, chatId, me.id, content, createdAt, attJson);
+  const message = groupChatMessageRow({ id, chat_id: chatId, sender_id: me.id, content, created_at: createdAt, attachments: attJson });
+  if (clientId) message.clientId = clientId;
+  log.info('msg.gchat', 'message sent', { chat: chatId, from: me.username, bytes: content.length });
+  broadcastToGroupChat(chatId, { type: 'group_chat_message', message });
+  send(res, 200, { message });
+});
+
+route('DELETE', /^\/api\/group-chats\/([a-f0-9]+)\/messages\/([a-f0-9]+)$/, async (req, res, [, chatId, msgId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!isGroupChatMember(me.id, chatId)) return sendError(res, 404, 'group chat not found');
+  const m = db.prepare('SELECT * FROM group_chat_messages WHERE id = ? AND chat_id = ?').get(msgId, chatId);
+  if (!m) return sendError(res, 404, 'message not found');
+  // Only the sender can delete (group-chat-owner-as-mod could come later).
+  if (m.sender_id !== me.id) return sendError(res, 403, 'not your message');
+  db.prepare('DELETE FROM group_chat_messages WHERE id = ?').run(msgId);
+  broadcastToGroupChat(chatId, { type: 'group_chat_message_deleted', chatId, messageId: msgId });
+  log.info('msg.gchat.delete', 'deleted', { chat: chatId, msg: msgId, by: me.username });
+  send(res, 200, { ok: true });
+});
+
 // ---------------- Servers (Discord-style guilds) ----------------
 
 route('POST', /^\/api\/servers$/, async (req, res) => {
@@ -1253,7 +1595,9 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/channels$/, async (req, res, [, ser
   const body = await readJson(req);
   const candidate = (body.name || '').toString().trim().toLowerCase();
   if (!CHANNEL_NAME_RE.test(candidate)) return sendError(res, 400, `name must match ${CHANNEL_NAME_RE} (lowercase letters, digits, dash, underscore; max ${MAX_CHANNEL_NAME})`);
-  const kind = (body.kind === 'announcement') ? 'announcement' : 'text';
+  const kind = (body.kind === 'announcement') ? 'announcement'
+             : (body.kind === 'voice')        ? 'voice'
+             : 'text';
   const id = newId();
   const now = Date.now();
   const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM channels WHERE server_id = ?').get(serverId).p;
@@ -1280,7 +1624,9 @@ route('PATCH', /^\/api\/channels\/([a-f0-9]+)$/, async (req, res, [, channelId])
     updates.push('name = ?'); args.push(n);
   }
   if (typeof body.kind === 'string') {
-    const k = (body.kind === 'announcement') ? 'announcement' : 'text';
+    const k = (body.kind === 'announcement') ? 'announcement'
+            : (body.kind === 'voice')        ? 'voice'
+            : 'text';
     updates.push('kind = ?'); args.push(k);
   }
   if (!updates.length) return sendError(res, 400, 'no updatable fields');
@@ -1328,6 +1674,9 @@ route('POST', /^\/api\/channels\/([a-f0-9]+)\/messages$/, async (req, res, [, ch
   if (!me) return sendError(res, 401, 'not authenticated');
   const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(channelId);
   if (!ch || !userIsServerMember(me.id, ch.server_id)) return sendError(res, 404, 'channel not found');
+  // Voice channels don't carry text messages — they're persistent mesh
+  // rooms. Use room.* WS messages to join/leave instead.
+  if (ch.kind === 'voice') return sendError(res, 400, 'voice channels do not support text messages');
   // Announcement channels: only the server owner can post.
   if (ch.kind === 'announcement' && !userOwnsServer(me.id, ch.server_id)) {
     return sendError(res, 403, 'only the server owner can post in announcement channels');
@@ -1501,6 +1850,79 @@ wss.on('connection', (ws, req) => {
       ws.send(JSON.stringify({ type: 'auth_ok' }));
     } else if (msg.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong' }));
+    } else if (msg.type && msg.type.startsWith('room.')) {
+      // Multi-party voice rooms (group calls + voice channels). The room
+      // identifier is opaque to the server: the renderer picks it as
+      // either the call's UUID (for a group-call invite) or the
+      // channel ID (for a persistent voice channel). Server just tracks
+      // presence + relays member-joined / member-left events.
+      if (!ws.userId) return;
+      const subType = msg.type.slice(5);
+      if (subType === 'join') {
+        const roomId = String(msg.roomId || '');
+        if (!roomId) return;
+        joinRoom(roomId, ws.userId, ws);
+        const others = roomMembers(roomId).filter((id) => id !== ws.userId);
+        // Tell the joiner who's already in the room (so they can build
+        // peer connections to each existing member).
+        ws.send(JSON.stringify({
+          type: 'room.joined',
+          roomId,
+          members: others,
+          you: ws.userId,
+        }));
+        // For voice CHANNELS (persistent), broadcast presence to every
+        // server member so non-room users see who's in the channel.
+        // For ephemeral group-call rooms, just tell the existing peers.
+        const ch = db.prepare("SELECT * FROM channels WHERE id = ? AND kind = 'voice'").get(roomId);
+        if (ch) {
+          broadcastToServer(ch.server_id, {
+            type: 'voice_channel_member-joined',
+            channelId: roomId,
+            userId: ws.userId,
+            username: ws.username,
+          });
+        }
+        for (const otherId of others) {
+          broadcastToUser(otherId, {
+            type: 'room.member-joined',
+            roomId,
+            userId: ws.userId,
+            username: ws.username,
+          });
+        }
+        log.info('room.join', 'joined', { user: ws.username, room: roomId, n: others.length + 1, voice: !!ch });
+      } else if (subType === 'leave') {
+        const roomId = String(msg.roomId || '');
+        if (!roomId) return;
+        leaveRoom(roomId, ws.userId);
+        const others = roomMembers(roomId);
+        const ch = db.prepare("SELECT * FROM channels WHERE id = ? AND kind = 'voice'").get(roomId);
+        if (ch) {
+          broadcastToServer(ch.server_id, {
+            type: 'voice_channel_member-left',
+            channelId: roomId,
+            userId: ws.userId,
+          });
+        }
+        for (const otherId of others) {
+          broadcastToUser(otherId, {
+            type: 'room.member-left',
+            roomId,
+            userId: ws.userId,
+          });
+        }
+        log.info('room.leave', 'left', { user: ws.username, room: roomId, remaining: others.length });
+      } else if (subType === 'list') {
+        // Used by voice-channel UI to show "who's currently in" a channel.
+        const roomId = String(msg.roomId || '');
+        if (!roomId) return;
+        ws.send(JSON.stringify({
+          type: 'room.list',
+          roomId,
+          members: roomMembers(roomId),
+        }));
+      }
     } else if (msg.type && msg.type.startsWith('call.')) {
       // WebRTC signaling relay for 1:1 voice calls. The server does not
       // peek inside the SDP/ICE payloads — it just forwards them between
@@ -1533,7 +1955,32 @@ wss.on('connection', (ws, req) => {
     if (ws.userId && sockets.has(ws.userId)) {
       const set = sockets.get(ws.userId);
       set.delete(ws);
-      if (set.size === 0) sockets.delete(ws.userId);
+      if (set.size === 0) {
+        sockets.delete(ws.userId);
+        // Last socket gone — sweep this user out of every mesh room they
+        // were in, and tell remaining room members so they can drop
+        // their peer connections.
+        const swept = sweepUserFromRooms(ws.userId);
+        for (const roomId of swept) {
+          const ch = db.prepare("SELECT * FROM channels WHERE id = ? AND kind = 'voice'").get(roomId);
+          if (ch) {
+            broadcastToServer(ch.server_id, {
+              type: 'voice_channel_member-left',
+              channelId: roomId,
+              userId: ws.userId,
+            });
+          }
+          for (const otherId of roomMembers(roomId)) {
+            broadcastToUser(otherId, {
+              type: 'room.member-left',
+              roomId,
+              userId: ws.userId,
+              reason: 'disconnect',
+            });
+          }
+        }
+        if (swept.length) log.info('room.sweep', 'cleared on disconnect', { user: ws.username, rooms: swept.length });
+      }
       log.info('ws.close', 'connection closed', {
         user: ws.username || '(unauth)',
         code,

@@ -35,6 +35,18 @@ Probably do **(1)** first — lower bandwidth, and the sync feels more
 like Discord's experience. Add `(2)` as an explicit "share my browser"
 button if needed.
 
+### Group call invites (UI + flow)
+
+Mesh signaling works in 0.1.32 for voice CHANNELS (clicking joins the
+persistent room). For group DM voice calls we still need a "Call this
+group" button that:
+1. Generates a roomId UUID.
+2. Server fans out `call.invite` to all chat members with that roomId.
+3. Each accepter triggers `room.join` with the same roomId.
+4. Mesh handles the rest.
+
+This is mostly UI — the WS plumbing and MeshSession already work.
+
 ### YouTube with adblock
 
 Not trivial. YouTube serves ads as part of the same stream now (no

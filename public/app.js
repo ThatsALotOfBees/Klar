@@ -110,6 +110,20 @@ const state = {
   usersById: new Map(),
   realtime: null,
   userlistHidden: false,
+
+  // Group chats (multi-party DMs). Same shape as `dms` but with a
+  // `members` array. Messages live in messagesByGroup.
+  groupChats: [],
+  messagesByGroup: new Map(),
+  groupHistoryFetched: new Set(),
+  activeGroupChatId: null,
+
+  // Voice channel presence: channelId -> Set<userId>. Updated by
+  // voice_channel_member-joined / -left WS events.
+  voiceChannelMembers: new Map(),
+  // The MeshSession instance the user is currently in (voice channel
+  // or group call). Single-room-at-a-time for now.
+  mesh: null,
   settings: null,           // populated by loadSettings() at boot
   call: null,               // populated by CallManager when active
   globalMicMuted: false,    // me-bar mic icon toggles this
@@ -842,6 +856,232 @@ class CallManager {
 
 const callMgr = new CallManager();
 
+// ===========================================================================
+// MeshSession — multi-party voice (voice channels + group DM calls)
+// ===========================================================================
+//
+// Architecture: each pair of participants in the room maintains its own
+// RTCPeerConnection (full mesh). Server tracks room membership in memory
+// (`rooms` Map keyed by roomId) and relays member-joined/-left events.
+// The renderer creates a pc to each existing peer when joining, and
+// receives offers from new peers as they arrive.
+//
+// This is a deliberately simple SFU-less design: scales fine to ~6
+// people on a residential connection. Beyond that we'd want a media
+// server (mediasoup, livekit) — out of scope for now.
+
+class MeshSession extends EventTarget {
+  constructor() {
+    super();
+    this.roomId = null;
+    this.kind = null;        // 'voice-channel' | 'group-call'
+    this.scope = null;       // channelId for voice-channel, chatId for group-call
+    this.peers = new Map();  // peerUserId -> { pc, remoteAudio, candidates: [] }
+    this.localStream = null;
+    this.state = 'idle';     // idle | joining | connected | leaving
+  }
+
+  async join(roomId, kind, scope) {
+    if (this.state !== 'idle') {
+      klog.warn('mesh.join', 'already in a room', { state: this.state });
+      return false;
+    }
+    this.roomId = roomId;
+    this.kind = kind;
+    this.scope = scope;
+    this.state = 'joining';
+    klog.info('mesh.join', 'joining', { room: roomId, kind });
+
+    const v = state.settings.voice;
+    try {
+      this.localStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: v.inputDeviceId ? { exact: v.inputDeviceId } : undefined,
+          noiseSuppression: !!v.noiseSuppression,
+          echoCancellation: !!v.echoCancellation,
+          autoGainControl:  !!v.autoGain,
+        },
+        video: false,
+      });
+    } catch (e) {
+      klog.error('mesh.join', 'getUserMedia failed', { err: e.message });
+      this.state = 'idle';
+      alert('Could not access microphone: ' + (e.message || e));
+      return false;
+    }
+    if (state.globalMicMuted) for (const t of this.localStream.getAudioTracks()) t.enabled = false;
+
+    if (!state.realtime || !state.realtime.send({ type: 'room.join', roomId })) {
+      this._teardown();
+      alert('Lost connection to server, can\'t join voice room.');
+      return false;
+    }
+    state.mesh = this;
+    return true;
+  }
+
+  // Server told us who's already here. Build pcs to each, sending offers.
+  async onJoined(msg) {
+    if (msg.roomId !== this.roomId) return;
+    klog.info('mesh.joined', `${msg.members.length} existing peers`, { room: this.roomId });
+    this.state = 'connected';
+    for (const peerId of msg.members) {
+      try { await this._createPeer(peerId, /* createOffer */ true); }
+      catch (e) { klog.error('mesh.peer', 'create failed', { peer: peerId, err: e.message }); }
+    }
+    this.dispatchEvent(new CustomEvent('changed'));
+  }
+
+  // A new peer joined AFTER us. They will create the offer (impolite
+  // role); we just wait for it via onSignal('offer').
+  onMemberJoined(msg) {
+    if (msg.roomId !== this.roomId) return;
+    klog.info('mesh.peer-joined', 'incoming peer', { peer: msg.userId });
+    this.dispatchEvent(new CustomEvent('changed'));
+  }
+
+  onMemberLeft(msg) {
+    if (msg.roomId !== this.roomId) return;
+    const entry = this.peers.get(msg.userId);
+    if (entry) {
+      try { entry.pc.close(); } catch {}
+      try { if (entry.remoteAudio) entry.remoteAudio.remove(); } catch {}
+      this.peers.delete(msg.userId);
+    }
+    klog.info('mesh.peer-left', 'peer dropped', { peer: msg.userId, remaining: this.peers.size });
+    this.dispatchEvent(new CustomEvent('changed'));
+  }
+
+  // call.signal arrived from a specific peer. Apply via the per-peer pc.
+  async onSignal(msg) {
+    const peerId = msg.fromUserId;
+    if (!peerId) return;
+    const payload = msg.payload || {};
+    let entry = this.peers.get(peerId);
+    if (!entry) {
+      // First signal from this peer (likely an offer from a late joiner
+      // that we hadn't yet made a pc for). Build the receive-side pc.
+      if (payload.kind !== 'offer' && payload.kind !== 'candidate') return;
+      try { await this._createPeer(peerId, /* createOffer */ false); }
+      catch (e) { klog.error('mesh.signal', 'lazy create failed', { err: e.message }); return; }
+      entry = this.peers.get(peerId);
+      if (!entry) return;
+    }
+    const pc = entry.pc;
+    try {
+      if (payload.kind === 'offer') {
+        await pc.setRemoteDescription(payload.sdp);
+        for (const c of entry.candidates) { try { await pc.addIceCandidate(c); } catch {} }
+        entry.candidates = [];
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        this._sendSignal(peerId, { kind: 'answer', sdp: answer });
+      } else if (payload.kind === 'answer') {
+        await pc.setRemoteDescription(payload.sdp);
+        for (const c of entry.candidates) { try { await pc.addIceCandidate(c); } catch {} }
+        entry.candidates = [];
+      } else if (payload.kind === 'candidate' && payload.candidate) {
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+          try { await pc.addIceCandidate(payload.candidate); } catch {}
+        } else {
+          entry.candidates.push(payload.candidate);
+        }
+      }
+    } catch (e) {
+      klog.error('mesh.signal', 'apply failed', { peer: peerId, kind: payload.kind, err: e.message });
+    }
+  }
+
+  async leave() {
+    if (this.state === 'idle') return;
+    klog.info('mesh.leave', 'leaving', { room: this.roomId });
+    const wasScope = this.scope;
+    if (state.realtime) state.realtime.send({ type: 'room.leave', roomId: this.roomId });
+    this._teardown();
+    hideActiveCallBar(null);
+    // Refresh the channel sidebar so the "joined" indicator drops.
+    if (state.view.kind === 'server') renderChannelList(state.view.serverId);
+  }
+
+  async _createPeer(peerId, createOffer) {
+    const pc = new RTCPeerConnection(ICE_CONFIG);
+    for (const t of this.localStream.getAudioTracks()) pc.addTrack(t, this.localStream);
+    const entry = { pc, remoteAudio: null, candidates: [] };
+    this.peers.set(peerId, entry);
+
+    pc.ontrack = (e) => {
+      if (!entry.remoteAudio) {
+        entry.remoteAudio = document.createElement('audio');
+        entry.remoteAudio.autoplay = true;
+        entry.remoteAudio.style.display = 'none';
+        document.body.appendChild(entry.remoteAudio);
+      }
+      entry.remoteAudio.srcObject = e.streams[0];
+      entry.remoteAudio.muted = state.globalDeafened;
+      const out = state.settings.voice.outputDeviceId;
+      if (out && entry.remoteAudio.setSinkId) entry.remoteAudio.setSinkId(out).catch(() => {});
+      entry.remoteAudio.volume = Math.min(1, state.settings.voice.outputVol / 100);
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this._sendSignal(peerId, { kind: 'candidate', candidate: e.candidate });
+    };
+    pc.onconnectionstatechange = () => {
+      klog.info('mesh.pcstate', pc.connectionState, { peer: peerId });
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        // Don't tear down the whole session — just this one peer.
+        this.peers.delete(peerId);
+        try { entry.remoteAudio && entry.remoteAudio.remove(); } catch {}
+        this.dispatchEvent(new CustomEvent('changed'));
+      }
+    };
+    if (createOffer) {
+      const offer = await pc.createOffer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(offer);
+      this._sendSignal(peerId, { kind: 'offer', sdp: offer });
+    }
+  }
+
+  _sendSignal(peerId, payload) {
+    if (!state.realtime) return;
+    state.realtime.send({
+      type: 'call.signal',
+      toUserId: peerId,
+      callId: this.roomId,
+      payload,
+    });
+  }
+
+  _teardown() {
+    for (const [, entry] of this.peers) {
+      try { entry.pc.close(); } catch {}
+      try { if (entry.remoteAudio) entry.remoteAudio.remove(); } catch {}
+    }
+    this.peers.clear();
+    if (this.localStream) {
+      for (const t of this.localStream.getTracks()) try { t.stop(); } catch {}
+      this.localStream = null;
+    }
+    this.roomId = null;
+    this.kind = null;
+    this.scope = null;
+    this.state = 'idle';
+    if (state.mesh === this) state.mesh = null;
+    this.dispatchEvent(new CustomEvent('changed'));
+  }
+
+  // Apply mute/deafen toggles to our peers.
+  applyMute() {
+    if (this.localStream) for (const t of this.localStream.getAudioTracks()) t.enabled = !state.globalMicMuted;
+  }
+  applyDeafen() {
+    for (const [, entry] of this.peers) {
+      if (entry.remoteAudio) entry.remoteAudio.muted = state.globalDeafened;
+    }
+  }
+}
+
+const meshSession = new MeshSession();
+
 // --- Active-call banner (Discord-style, top of the DM messages area) -------
 //
 // Single banner element lives inside [data-chat-active] in tpl-app. We keep
@@ -901,7 +1141,17 @@ function showActiveCallBar(peer, stateText) {
         if (callMgr.screenSender) callMgr.stopScreenShare();
         else openScreenShareModal();
       }
-      else if (b.dataset.callCtrl === 'hangup') callMgr.hangup();
+      else if (b.dataset.callCtrl === 'hangup') {
+        // If we're in a 1:1 call, hang it up. If we're in a mesh room
+        // (voice channel / group call), leave that instead. Both sets
+        // are mutually exclusive in practice.
+        if (callMgr.state && callMgr.state !== 'idle') callMgr.hangup();
+        else if (state.mesh) {
+          meshSession.leave();
+          hideActiveCallBar('Left voice channel');
+          if (state.view.kind === 'server') renderChannelList(state.view.serverId);
+        }
+      }
     });
   });
 
@@ -1648,9 +1898,35 @@ function enterApp() {
   state.realtime.addEventListener('call.invite',         (e) => callMgr.onIncomingInvite(e.detail));
   state.realtime.addEventListener('call.accept',         (e) => callMgr.onAccept(e.detail));
   state.realtime.addEventListener('call.decline',        (e) => callMgr.onDecline(e.detail));
-  state.realtime.addEventListener('call.signal',         (e) => callMgr.onSignal(e.detail));
+  state.realtime.addEventListener('call.signal',         (e) => {
+    // Disambiguate: if we're in a mesh room and the callId matches the
+    // mesh roomId, route to mesh. Else route to the 1:1 CallManager.
+    const detail = e.detail;
+    if (state.mesh && state.mesh.roomId && detail.callId === state.mesh.roomId) {
+      meshSession.onSignal(detail);
+    } else {
+      callMgr.onSignal(detail);
+    }
+  });
   state.realtime.addEventListener('call.hangup',         (e) => callMgr.onHangup(e.detail));
   state.realtime.addEventListener('call.state',          (e) => callMgr.onState(e.detail));
+
+  // Mesh room events (group calls + voice channels)
+  state.realtime.addEventListener('room.joined',         (e) => meshSession.onJoined(e.detail));
+  state.realtime.addEventListener('room.member-joined',  (e) => meshSession.onMemberJoined(e.detail));
+  state.realtime.addEventListener('room.member-left',    (e) => meshSession.onMemberLeft(e.detail));
+
+  // Voice channel presence (server-wide broadcast — not just room peers).
+  state.realtime.addEventListener('voice_channel_member-joined', (e) => onVoiceChannelMemberJoined(e.detail));
+  state.realtime.addEventListener('voice_channel_member-left',   (e) => onVoiceChannelMemberLeft(e.detail));
+
+  // Group chat WS events
+  state.realtime.addEventListener('group_chat_created', (e) => onRemoteGroupChatCreated(e.detail.chat));
+  state.realtime.addEventListener('group_chat_updated', (e) => onRemoteGroupChatUpdated(e.detail.chat));
+  state.realtime.addEventListener('group_chat_left',    (e) => onRemoteGroupChatLeft(e.detail));
+  state.realtime.addEventListener('group_chat_message', (e) => onRemoteGroupChatMessage(e.detail.message));
+  state.realtime.addEventListener('group_chat_message_deleted', (e) => onRemoteGroupChatMessageDeleted(e.detail));
+
   state.realtime.connect();
 
   // Render the home view IMMEDIATELY with whatever's cached (usually empty
@@ -1660,6 +1936,7 @@ function enterApp() {
   setupComposer();
 
   loadDms().catch((e) => klog.error('enterApp.loadDms', 'failed', { err: e.message }));
+  loadGroupChats().catch((e) => klog.error('enterApp.loadGroupChats', 'failed', { err: e.message }));
   loadServers().catch((e) => klog.error('enterApp.loadServers', 'failed', { err: e.message }));
 
   // Re-discover the server URL every minute so friends auto-track tunnel
@@ -1676,6 +1953,160 @@ async function loadDms() {
   for (const dm of dms) rememberUser(dm.other);
   // Re-render the sidebar if we're still on home view.
   if (state.view.kind === 'home') renderDmList();
+}
+
+async function loadGroupChats() {
+  try {
+    const { groupChats } = await api.listGroupChats();
+    state.groupChats = groupChats || [];
+    for (const g of state.groupChats) {
+      for (const m of (g.members || [])) rememberUser(m);
+    }
+    if (state.view.kind === 'home') renderDmList();
+  } catch (e) {
+    klog.warn('groups.load', 'failed', { err: e.message });
+  }
+}
+
+// Group-chat WS handlers ----------------------------------------------------
+
+function onRemoteGroupChatCreated(chat) {
+  if (!chat || !chat.id) return;
+  if (state.groupChats.find((g) => g.id === chat.id)) return;
+  state.groupChats.unshift(chat);
+  for (const m of chat.members || []) rememberUser(m);
+  if (state.view.kind === 'home') renderDmList();
+}
+
+function onRemoteGroupChatUpdated(chat) {
+  if (!chat || !chat.id) return;
+  const idx = state.groupChats.findIndex((g) => g.id === chat.id);
+  if (idx >= 0) state.groupChats[idx] = chat;
+  else state.groupChats.unshift(chat);
+  for (const m of chat.members || []) rememberUser(m);
+  if (state.view.kind === 'home') renderDmList();
+  // If we're currently in this chat, refresh the header (member list might have changed).
+  if (state.activeGroupChatId === chat.id) {
+    refreshGroupChatHeader(chat);
+  }
+}
+
+function onRemoteGroupChatLeft(payload) {
+  state.groupChats = state.groupChats.filter((g) => g.id !== payload.chatId);
+  state.messagesByGroup.delete(payload.chatId);
+  state.groupHistoryFetched.delete(payload.chatId);
+  if (state.view.kind === 'home') renderDmList();
+  if (state.activeGroupChatId === payload.chatId) {
+    state.activeGroupChatId = null;
+    root.querySelector('[data-chat-active]').classList.add('hidden');
+    root.querySelector('[data-chat-empty]').classList.remove('hidden');
+  }
+}
+
+function onRemoteGroupChatMessage(message) {
+  let list = state.messagesByGroup.get(message.groupChatId);
+  if (!list) { list = []; state.messagesByGroup.set(message.groupChatId, list); }
+  // Already-confirmed dedupe.
+  if (list.find((m) => m.id === message.id && !m.pending)) return;
+  // Optimistic-send reconciliation.
+  let pending = null;
+  if (message.clientId) pending = list.find((m) => m.pending && m.clientId === message.clientId);
+  if (pending) {
+    pending.id = message.id;
+    pending.createdAt = message.createdAt;
+    pending.pending = false;
+    confirmPendingDom(pending.clientId, message);
+  } else {
+    list.push(message);
+    if (state.activeGroupChatId === message.groupChatId) {
+      const chat = state.groupChats.find((g) => g.id === message.groupChatId);
+      if (chat) appendGroupMessage(chat, message);
+    }
+    // Notification path (reuse the DM notification shape).
+    if (state.user && message.senderId !== state.user.id) {
+      const chat = state.groupChats.find((g) => g.id === message.groupChatId);
+      if (chat) showGroupChatNotification(chat, message);
+    }
+  }
+  // Move chat to top of sidebar list.
+  const idx = state.groupChats.findIndex((g) => g.id === message.groupChatId);
+  if (idx >= 0) {
+    state.groupChats[idx].lastAt = message.createdAt;
+    const [g] = state.groupChats.splice(idx, 1);
+    state.groupChats.unshift(g);
+    if (state.view.kind === 'home') renderDmList();
+  }
+}
+
+function onRemoteGroupChatMessageDeleted(payload) {
+  const list = state.messagesByGroup.get(payload.chatId);
+  if (list) {
+    const idx = list.findIndex((m) => m.id === payload.messageId);
+    if (idx >= 0) list.splice(idx, 1);
+  }
+  if (state.activeGroupChatId === payload.chatId) {
+    const row = root.querySelector(`[data-messages] [data-message-id="${payload.messageId}"]`);
+    if (row) row.remove();
+  }
+}
+
+// Voice-channel presence ----------------------------------------------------
+
+function onVoiceChannelMemberJoined(payload) {
+  const set = state.voiceChannelMembers.get(payload.channelId) || new Set();
+  set.add(payload.userId);
+  state.voiceChannelMembers.set(payload.channelId, set);
+  if (state.view.kind === 'server') renderChannelList(state.view.serverId);
+}
+function onVoiceChannelMemberLeft(payload) {
+  const set = state.voiceChannelMembers.get(payload.channelId);
+  if (set) {
+    set.delete(payload.userId);
+    if (set.size === 0) state.voiceChannelMembers.delete(payload.channelId);
+  }
+  if (state.view.kind === 'server') renderChannelList(state.view.serverId);
+}
+
+// Show an OS notification for a group-chat message — same path as DMs.
+function showGroupChatNotification(chat, message) {
+  const n = state.settings && state.settings.notifications;
+  if (!n || !n.enabled) return;
+  if (_windowFocused && state.activeGroupChatId === chat.id && !n.showWhenFocused) return;
+  ensureNotifyPermission();
+  playNotifySound();
+  const sender = userById(message.senderId) || { username: '?', displayName: 'Someone' };
+  const title = (chat.name || groupChatDefaultName(chat)) + ' · ' + (sender.displayName || sender.username);
+  let body = (message.content || '').trim();
+  if (!body && message.attachments && message.attachments.length) {
+    body = '[attachment: ' + (message.attachments[0].name || 'file') + ']';
+  }
+  if (body.length > 200) body = body.slice(0, 197) + '…';
+  if (!body) body = '(new message)';
+  const open = () => {
+    try { window.focus(); } catch {}
+    if (window.klar && window.klar.shell && window.klar.shell.show) try { window.klar.shell.show(); } catch {}
+    switchView({ kind: 'home' });
+    setTimeout(() => openGroupChat(chat.id), 30);
+  };
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try {
+      const note = new Notification(title, {
+        body, silent: true, tag: 'klar-gchat-' + chat.id, renotify: true,
+      });
+      note.onclick = () => { open(); try { note.close(); } catch {} };
+    } catch {}
+  }
+  if (window.klar && window.klar.shell && window.klar.shell.flash) try { window.klar.shell.flash(); } catch {}
+}
+
+// Default name for a group chat that hasn't been explicitly named — list
+// the first 3 member display names. Excludes the current user.
+function groupChatDefaultName(chat) {
+  if (chat.name) return chat.name;
+  const others = (chat.members || []).filter((m) => m.id !== (state.user && state.user.id));
+  const names = others.slice(0, 3).map((m) => m.displayName || m.username);
+  if (others.length > 3) names.push('+' + (others.length - 3));
+  return names.join(', ') || 'Group chat';
 }
 
 async function loadServers() {
@@ -1719,6 +2150,7 @@ function renderServerRail() {
 async function switchView(view) {
   state.view = view;
   state.activeDmId = null;
+  state.activeGroupChatId = null;
   state.activeChannelId = null;
 
   root.querySelector('[data-chat-active]').classList.add('hidden');
@@ -1751,6 +2183,8 @@ function renderHomeSidebar() {
   setupUserSearch();
   renderDmList();
   renderMeBar();
+  const newGroupBtn = root.querySelector('[data-action="new-group-chat"]');
+  if (newGroupBtn) newGroupBtn.addEventListener('click', openCreateGroupChatModal);
 
   const emptyTitle = root.querySelector('[data-chat-empty] h2');
   const emptyP = root.querySelector('[data-chat-empty] p');
@@ -1762,6 +2196,23 @@ function renderDmList() {
   const ul = root.querySelector('[data-dm-list]');
   if (!ul) return;
   clear(ul);
+
+  // Group chats first (most-recent-by-message at the top), then 1:1 DMs.
+  // Both lists are already pre-sorted by lastAt server-side / on insert.
+  for (const g of state.groupChats) {
+    const li = document.createElement('li');
+    li.className = 'dm-item gchat' + (g.id === state.activeGroupChatId ? ' active' : '');
+    li.innerHTML = `<div class="avatar group"></div><div class="dm-name"></div>`;
+    paintGroupAvatar(li.querySelector('.avatar'), g);
+    li.querySelector('.dm-name').textContent = groupChatDefaultName(g);
+    li.addEventListener('click', () => openGroupChat(g.id));
+    li.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openGroupChatContextMenu(e.clientX, e.clientY, g);
+    });
+    ul.appendChild(li);
+  }
+
   for (const dm of state.dms) {
     const li = document.createElement('li');
     li.className = 'dm-item' + (dm.id === state.activeDmId ? ' active' : '');
@@ -1775,6 +2226,37 @@ function renderDmList() {
     });
     ul.appendChild(li);
   }
+}
+
+// Compose-style avatar for a group chat — overlapping member avatars.
+function paintGroupAvatar(el, chat) {
+  el.innerHTML = '';
+  el.classList.add('group');
+  const others = (chat.members || []).filter((m) => m.id !== (state.user && state.user.id)).slice(0, 2);
+  for (const m of others) {
+    const sub = document.createElement('div');
+    sub.className = 'group-sub';
+    paintAvatar(sub, m);
+    el.appendChild(sub);
+  }
+}
+
+function openGroupChatContextMenu(x, y, chat) {
+  const isOwner = state.user && chat.ownerId === state.user.id;
+  openContextMenu(x, y, [
+    { label: 'Open chat',         icon: 'klar-asteroid', onClick: () => openGroupChat(chat.id) },
+    { label: 'Add members',       icon: 'klar-users',    onClick: () => openAddGroupMembersModal(chat) },
+    { divider: true },
+    { label: isOwner ? 'Delete group' : 'Leave group', icon: 'klar-x', danger: true,
+      onClick: () => leaveGroupChat(chat) },
+  ]);
+}
+
+async function leaveGroupChat(chat) {
+  const verb = (chat.ownerId === state.user.id) ? 'Delete' : 'Leave';
+  if (!confirm(`${verb} this group chat?`)) return;
+  try { await api.removeGroupMember(chat.id, state.user.id); }
+  catch (e) { alert('Failed: ' + (e.message || 'error')); }
 }
 
 function openDmContextMenu(x, y, dm) {
@@ -1918,11 +2400,14 @@ function toggleGlobalDeafen() {
   if (callMgr.state === 'connected') callMgr.broadcastState();
 }
 function applyMicMuteState() {
-  if (!callMgr.localStream) return;
-  for (const t of callMgr.localStream.getAudioTracks()) t.enabled = !state.globalMicMuted;
+  if (callMgr.localStream) {
+    for (const t of callMgr.localStream.getAudioTracks()) t.enabled = !state.globalMicMuted;
+  }
+  meshSession.applyMute();
 }
 function applyDeafenState() {
   if (callMgr.remoteAudio) callMgr.remoteAudio.muted = state.globalDeafened;
+  meshSession.applyDeafen();
 }
 
 // ===========================================================================
@@ -1987,20 +2472,64 @@ function renderChannelList(serverId) {
   const meOwns = detail.server.ownerId === state.user.id;
 
   for (const ch of detail.channels) {
+    const isVoice = ch.kind === 'voice';
+    const inThisVoice = isVoice && state.mesh && state.mesh.scope === ch.id;
     const li = document.createElement('li');
-    li.className = 'channel-item' + (ch.id === state.activeChannelId ? ' active' : '') + (ch.kind === 'announcement' ? ' announcement' : '');
+    li.className = 'channel-item'
+      + (ch.id === state.activeChannelId && !isVoice ? ' active' : '')
+      + (ch.kind === 'announcement' ? ' announcement' : '')
+      + (isVoice ? ' voice' : '')
+      + (inThisVoice ? ' joined' : '');
     li.innerHTML = `<span class="channel-icon"></span><span class="channel-name"></span>`;
-    // Different glyph for announcement channels (megaphone-ish via mic icon
-    // since we don't have a megaphone yet — visually distinct enough).
-    const iconId = ch.kind === 'announcement' ? 'klar-mic' : 'klar-hash';
+    const iconId = isVoice ? 'klar-headphones' : ch.kind === 'announcement' ? 'klar-mic' : 'klar-hash';
     li.querySelector('.channel-icon').appendChild(svgIcon(iconId, 18));
     li.querySelector('.channel-name').textContent = ch.name;
-    li.addEventListener('click', () => openChannel(ch.id));
+    li.addEventListener('click', () => {
+      if (isVoice) joinVoiceChannel(ch);
+      else openChannel(ch.id);
+    });
     li.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       openChannelContextMenu(e.clientX, e.clientY, ch, meOwns, serverId);
     });
     ul.appendChild(li);
+
+    // For voice channels, render the current member list as nested rows
+    // beneath the channel itself.
+    if (isVoice) {
+      const present = state.voiceChannelMembers.get(ch.id);
+      const members = present ? Array.from(present) : (Array.isArray(ch.voiceMembers) ? ch.voiceMembers : []);
+      if (members.length) {
+        const sub = document.createElement('li');
+        sub.className = 'voice-members';
+        for (const uid of members) {
+          const u = userById(uid) || { id: uid, displayName: '?', username: '?' };
+          const row = document.createElement('div');
+          row.className = 'voice-member';
+          row.innerHTML = `<div class="avatar"></div><div class="name"></div>`;
+          paintAvatar(row.querySelector('.avatar'), u);
+          row.querySelector('.name').textContent = u.displayName || u.username;
+          sub.appendChild(row);
+        }
+        ul.appendChild(sub);
+      }
+    }
+  }
+}
+
+async function joinVoiceChannel(ch) {
+  // If we're already in THIS voice channel, leave instead.
+  if (state.mesh && state.mesh.scope === ch.id) {
+    await meshSession.leave();
+    renderChannelList(ch.serverId);
+    return;
+  }
+  // If we're in a different mesh (another voice channel), leave it first.
+  if (state.mesh) await meshSession.leave();
+  const ok = await meshSession.join(ch.id, 'voice-channel', ch.id);
+  if (ok) {
+    showActiveCallBar({ id: ch.id, displayName: '#' + ch.name, username: ch.name }, 'In voice');
+    renderChannelList(ch.serverId);
   }
 }
 
@@ -2150,6 +2679,7 @@ function openProfileModal(user) {
 
 function openDm(dmId) {
   state.activeDmId = dmId;
+  state.activeGroupChatId = null;
   state.activeChannelId = null;
   renderDmList();
 
@@ -2239,6 +2769,215 @@ function renderDmMessages(dm) {
     list.appendChild(row);
   }
   list.scrollTop = list.scrollHeight;
+}
+
+// ===========================================================================
+// Group chat: open + render
+// ===========================================================================
+
+function openGroupChat(chatId) {
+  state.activeDmId = null;
+  state.activeChannelId = null;
+  state.activeGroupChatId = chatId;
+  renderDmList();
+
+  const chat = state.groupChats.find((g) => g.id === chatId);
+  if (!chat) return;
+
+  root.querySelector('[data-chat-empty]').classList.add('hidden');
+  root.querySelector('[data-chat-active]').classList.remove('hidden');
+
+  refreshGroupChatHeader(chat);
+
+  const status = root.querySelector('[data-composer-status]');
+  if (status) { status.textContent = ''; status.classList.remove('encrypted'); }
+
+  if (!state.messagesByGroup.has(chatId)) state.messagesByGroup.set(chatId, []);
+
+  renderGroupChatMessages(chat);
+  root.querySelector('[data-composer-input]').placeholder = `Message ${groupChatDefaultName(chat)}`;
+  root.querySelector('[data-composer-input]').focus();
+  klog.info('gchat.open', 'opened', { chat: chatId });
+
+  if (!state.groupHistoryFetched.has(chatId)) {
+    state.groupHistoryFetched.add(chatId);
+    api.listGroupMessages(chatId).then(({ messages: rows }) => {
+      const list = state.messagesByGroup.get(chatId) || [];
+      const seen = new Set(list.map((m) => m.id));
+      let added = 0;
+      for (const r of rows) if (!seen.has(r.id)) { list.push(r); added++; }
+      if (added > 0) {
+        list.sort((a, b) => a.createdAt - b.createdAt);
+        state.messagesByGroup.set(chatId, list);
+        if (state.activeGroupChatId === chatId) renderGroupChatMessages(chat);
+      }
+    }).catch((err) => {
+      state.groupHistoryFetched.delete(chatId);
+      klog.error('gchat.history', 'load failed', { chat: chatId, err: err && err.message });
+    });
+  }
+}
+
+function refreshGroupChatHeader(chat) {
+  const header = root.querySelector('[data-chat-header]');
+  if (!header) return;
+  clear(header);
+  header.innerHTML = `
+    <div class="chat-title">
+      <div class="avatar group"></div>
+      <div>
+        <div class="channel-name"></div>
+        <div class="peer-handle muted small"></div>
+      </div>
+    </div>
+    <div class="chat-topic">Group chat — ${chat.members.length} member${chat.members.length === 1 ? '' : 's'}</div>
+    <div class="actions">
+      <button class="icon-btn" data-action="gchat-rename" title="Rename group" aria-label="Rename group">
+        <svg width="18" height="18"><use href="#klar-settings"/></svg>
+      </button>
+      <button class="icon-btn" data-action="gchat-add"    title="Add members" aria-label="Add members">
+        <svg width="18" height="18"><use href="#klar-users"/></svg>
+      </button>
+    </div>
+  `;
+  paintGroupAvatar(header.querySelector('.avatar'), chat);
+  header.querySelector('.channel-name').textContent = groupChatDefaultName(chat);
+  const handles = (chat.members || []).filter((m) => m.id !== state.user.id).map((m) => '@' + m.username).slice(0, 5).join(', ');
+  header.querySelector('.peer-handle').textContent = handles + ((chat.members || []).length > 6 ? ', ...' : '');
+  header.querySelector('[data-action="gchat-rename"]').addEventListener('click', () => promptRenameGroup(chat));
+  header.querySelector('[data-action="gchat-add"]').addEventListener('click', () => openAddGroupMembersModal(chat));
+}
+
+async function promptRenameGroup(chat) {
+  const next = prompt('Group name (leave blank to remove the custom name):', chat.name || '');
+  if (next == null) return;
+  const trimmed = next.trim();
+  if (trimmed === (chat.name || '')) return;
+  try { await api.renameGroupChat(chat.id, trimmed); }
+  catch (e) { alert('Rename failed: ' + (e.message || 'error')); }
+}
+
+function renderGroupChatMessages(chat) {
+  const list = root.querySelector('[data-messages]');
+  clear(list);
+  const intro = document.createElement('div');
+  intro.className = 'channel-intro';
+  intro.innerHTML = `<div class="badge"></div><h3>Group line</h3><p></p>`;
+  intro.querySelector('.badge').appendChild(svgIcon('klar-users', 36));
+  intro.querySelector('p').textContent = `${chat.members.length} crew member${chat.members.length === 1 ? '' : 's'} in this group.`;
+  list.appendChild(intro);
+  const messages = state.messagesByGroup.get(chat.id) || [];
+  let prevDay = null;
+  for (const m of messages) {
+    const day = dayLabel(m.createdAt);
+    if (day !== prevDay) { list.appendChild(buildDayDivider(day, m.createdAt)); prevDay = day; }
+    const showHeader = shouldShowHeader(list.lastElementChild, m.senderId, m.createdAt);
+    const row = buildDmMessageRow({ other: { id: '?', displayName: '?' } }, m, showHeader); // reuse DM row builder; sender info comes from userById
+    list.appendChild(row);
+  }
+  list.scrollTop = list.scrollHeight;
+}
+
+function appendGroupMessage(chat, m) {
+  const list = root.querySelector('[data-messages]');
+  if (!list) return;
+  // Day divider if needed.
+  const day = dayLabel(m.createdAt);
+  const lastDay = list.lastElementChild && list.lastElementChild.dataset && list.lastElementChild.dataset.day;
+  if (day !== lastDay && !list.querySelector(`[data-day="${day}"]`)) {
+    list.appendChild(buildDayDivider(day, m.createdAt));
+  }
+  const showHeader = shouldShowHeader(list.lastElementChild, m.senderId, m.createdAt);
+  const row = buildDmMessageRow({ other: { id: '?', displayName: '?' } }, m, showHeader);
+  list.appendChild(row);
+  list.scrollTop = list.scrollHeight;
+}
+
+// Create-group-chat modal — multi-pick from your DM contacts.
+function openCreateGroupChatModal() {
+  openModal('tpl-modal-create-group-chat', (modal, close) => {
+    const picker = modal.querySelector('[data-member-picker]');
+    const submit = modal.querySelector('[data-form-submit]');
+    const selected = new Set();
+    // Use existing 1:1 DM peers as the contact list. Could be expanded to
+    // a user search in the future.
+    const candidates = state.dms.map((dm) => dm.other).filter(Boolean);
+    if (!candidates.length) {
+      picker.innerHTML = '<div class="muted small">No contacts yet — start a DM with someone first.</div>';
+      return;
+    }
+    picker.innerHTML = '';
+    for (const u of candidates) {
+      const row = document.createElement('label');
+      row.className = 'member-pick';
+      row.innerHTML = `<input type="checkbox" /><div class="avatar"></div><div class="member-name"></div>`;
+      paintAvatar(row.querySelector('.avatar'), u);
+      row.querySelector('.member-name').textContent = u.displayName + ' · @' + u.username;
+      row.querySelector('input').addEventListener('change', (e) => {
+        if (e.target.checked) selected.add(u.id); else selected.delete(u.id);
+        submit.disabled = selected.size === 0;
+        row.classList.toggle('picked', e.target.checked);
+      });
+      picker.appendChild(row);
+    }
+    const form = modal.querySelector('[data-form="create-group-chat"]');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      showModalError(modal, null);
+      const name = (new FormData(form).get('name') || '').toString().trim();
+      submit.disabled = true; submit.textContent = 'Creating…';
+      try {
+        const chat = await api.createGroupChat({ name, memberIds: Array.from(selected) });
+        close();
+        // Server broadcasts group_chat_created which inserts into state +
+        // re-renders the sidebar; we just open it.
+        setTimeout(() => openGroupChat(chat.id), 30);
+      } catch (err) {
+        showModalError(modal, err.message || 'failed to create group');
+        submit.disabled = false; submit.textContent = 'Create';
+      }
+    });
+  });
+}
+
+function openAddGroupMembersModal(chat) {
+  openModal('tpl-modal-add-group-members', (modal, close) => {
+    const picker = modal.querySelector('[data-member-picker]');
+    const submit = modal.querySelector('[data-form-submit]');
+    const selected = new Set();
+    const existingIds = new Set((chat.members || []).map((m) => m.id));
+    const candidates = state.dms.map((dm) => dm.other).filter((u) => u && !existingIds.has(u.id));
+    if (!candidates.length) {
+      picker.innerHTML = '<div class="muted small">All your DM contacts are already in this group.</div>';
+      return;
+    }
+    picker.innerHTML = '';
+    for (const u of candidates) {
+      const row = document.createElement('label');
+      row.className = 'member-pick';
+      row.innerHTML = `<input type="checkbox" /><div class="avatar"></div><div class="member-name"></div>`;
+      paintAvatar(row.querySelector('.avatar'), u);
+      row.querySelector('.member-name').textContent = u.displayName + ' · @' + u.username;
+      row.querySelector('input').addEventListener('change', (e) => {
+        if (e.target.checked) selected.add(u.id); else selected.delete(u.id);
+        submit.disabled = selected.size === 0;
+        row.classList.toggle('picked', e.target.checked);
+      });
+      picker.appendChild(row);
+    }
+    const form = modal.querySelector('[data-form="add-group-members"]');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      submit.disabled = true; submit.textContent = 'Adding…';
+      try {
+        await api.addGroupMembers(chat.id, Array.from(selected));
+        close();
+      } catch (err) {
+        showModalError(modal, err.message || 'failed to add members');
+        submit.disabled = false; submit.textContent = 'Add';
+      }
+    });
+  });
 }
 
 function buildChannelIntro({ kind, name, username }) {
@@ -2757,10 +3496,16 @@ function shouldShowHeader(prevRow, senderId, createdAt) {
 function openChannel(channelId) {
   state.activeChannelId = channelId;
   state.activeDmId = null;
+  state.activeGroupChatId = null;
   if (state.view.kind !== 'server') return;
   const detail = state.serverDetails.get(state.view.serverId);
   if (!detail) return;
   const ch = detail.channels.find((c) => c.id === channelId);
+  if (ch && ch.kind === 'voice') {
+    // Voice channels aren't text — clicking joins the mesh room.
+    joinVoiceChannel(ch);
+    return;
+  }
   if (!ch) return;
   renderChannelList(state.view.serverId);
 
@@ -2941,6 +3686,7 @@ function setupComposer() {
       const ready = composerState.pending.filter((p) => p.status === 'done').map((p) => p.uploaded);
       if (!text.trim() && !ready.length) return;
       if (state.activeDmId) await sendDmMessage(text, ready);
+      else if (state.activeGroupChatId) await sendGroupChatMessage(text, ready);
       else if (state.activeChannelId) await sendChannelMessage(text, ready);
       else return;
       input.value = '';
@@ -3071,6 +3817,36 @@ async function sendDmMessage(text, attachments) {
     await api.sendMessage(dm.id, text, clientId, att);
   } catch (err) {
     klog.error('msg.dm.send', 'failed', { dm: dm.id, clientId, err: err.message });
+    markMessageFailed(clientId, err.message);
+  }
+}
+
+async function sendGroupChatMessage(text, attachments) {
+  const chat = state.groupChats.find((g) => g.id === state.activeGroupChatId);
+  if (!chat) return;
+  const att = Array.isArray(attachments) ? attachments : [];
+  const clientId = newClientId();
+  const optimistic = {
+    id: 'tmp_' + clientId,
+    clientId,
+    groupChatId: chat.id,
+    senderId: state.user.id,
+    content: text,
+    encrypted: false,
+    nonce: null,
+    createdAt: Date.now(),
+    pending: true,
+    attachments: att,
+  };
+  let list = state.messagesByGroup.get(chat.id);
+  if (!list) { list = []; state.messagesByGroup.set(chat.id, list); }
+  list.push(optimistic);
+  appendGroupMessage(chat, optimistic);
+  klog.info('msg.gchat.send', 'sending', { chat: chat.id, clientId, bytes: text.length, attachments: att.length });
+  try {
+    await api.sendGroupMessage(chat.id, text, clientId, att);
+  } catch (err) {
+    klog.error('msg.gchat.send', 'failed', { chat: chat.id, clientId, err: err.message });
     markMessageFailed(clientId, err.message);
   }
 }
