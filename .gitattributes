@@ -25,3 +25,8 @@ client-releases/** -text
 *.jpeg -text
 *.gif -text
 *.ico -text
+
+# WebAssembly modules — byte-exact binary. Same reasoning as
+# client-releases/** above: sha256s computed by release-client.cjs
+# would mismatch if git ever line-ending-normalized these.
+*.wasm -text

@@ -149,6 +149,7 @@ const DEFAULT_SETTINGS = {
     echoCancellation: true,
     autoGain: true,
     noiseGate: 0,        // 0 = off; 1-100 maps to threshold
+    rnnoise: true,       // RNNoise suppressor — drops keyboards/taps, keeps voice
   },
   video: {
     inputDeviceId: '',
@@ -276,6 +277,94 @@ const ICE_CONFIG = {
   iceTransportPolicy: 'all',
   iceCandidatePoolSize: 4,
 };
+
+// ---------- RNNoise-based mic suppressor ----------
+//
+// WebRTC's built-in noiseSuppression handles steady-state noise (fans, hum)
+// but lets impulsive sounds (keyboard clicks, taps, mouse buttons) right
+// through. RNNoise is a small neural net trained on speech vs. non-speech
+// 48 kHz frames; it's specifically good at the impulsive stuff. We vendor
+// the worklet + wasm under public/vendor/rnnoise/ so there's no runtime
+// network fetch and no bundler. wrapStreamWithRnnoise() returns a denoised
+// MediaStream; the rest of the audio graph (gate, peer connection, loopback
+// meter) attaches to that. On any failure we fall back to the raw stream so
+// a busted suppressor never breaks a call.
+
+const RNNOISE_PROCESSOR_NAME = '@sapphi-red/web-noise-suppressor/rnnoise';
+const RNNOISE_WORKLET_URL = new URL('./vendor/rnnoise/workletProcessor.js', import.meta.url);
+const RNNOISE_WASM_URL = new URL('./vendor/rnnoise/rnnoise.wasm', import.meta.url);
+const RNNOISE_WASM_SIMD_URL = new URL('./vendor/rnnoise/rnnoise_simd.wasm', import.meta.url);
+
+let _rnnoiseSharedCtx = null;
+let _rnnoiseWasmBytes = null;
+let _rnnoiseWorkletReady = null;
+
+async function _wasmSimdSupported() {
+  try {
+    return await WebAssembly.validate(new Uint8Array([
+      0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,
+      10,10,1,8,0,65,0,253,15,253,98,11,
+    ]));
+  } catch { return false; }
+}
+
+async function _ensureRnnoiseAssets(ctx) {
+  if (!_rnnoiseWasmBytes) {
+    const url = (await _wasmSimdSupported()) ? RNNOISE_WASM_SIMD_URL : RNNOISE_WASM_URL;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`RNNoise wasm fetch failed (${res.status})`);
+    _rnnoiseWasmBytes = await res.arrayBuffer();
+  }
+  if (!_rnnoiseWorkletReady) {
+    _rnnoiseWorkletReady = ctx.audioWorklet.addModule(RNNOISE_WORKLET_URL);
+  }
+  await _rnnoiseWorkletReady;
+}
+
+function _getRnnoiseCtx() {
+  if (!_rnnoiseSharedCtx || _rnnoiseSharedCtx.state === 'closed') {
+    _rnnoiseSharedCtx = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 48000,
+    });
+  }
+  return _rnnoiseSharedCtx;
+}
+
+// Returns { stream, dispose() }. If suppression is disabled or fails, stream
+// === rawStream and dispose is a no-op.
+async function wrapStreamWithRnnoise(rawStream) {
+  if (!state.settings.voice.rnnoise) {
+    return { stream: rawStream, dispose: () => {} };
+  }
+  try {
+    const ctx = _getRnnoiseCtx();
+    if (ctx.state === 'suspended') await ctx.resume();
+    await _ensureRnnoiseAssets(ctx);
+
+    const src = ctx.createMediaStreamSource(rawStream);
+    // wasmBinary is structured-cloned into the worklet; copy each time so
+    // the worklet owns its own bytes.
+    const node = new AudioWorkletNode(ctx, RNNOISE_PROCESSOR_NAME, {
+      processorOptions: { maxChannels: 1, wasmBinary: _rnnoiseWasmBytes.slice(0) },
+    });
+    const dest = ctx.createMediaStreamDestination();
+    src.connect(node);
+    node.connect(dest);
+
+    klog.info('rnnoise', 'suppressor active', { simd: _rnnoiseWasmBytes.byteLength });
+    return {
+      stream: dest.stream,
+      dispose() {
+        try { src.disconnect(); } catch {}
+        try { node.disconnect(); } catch {}
+        try { node.port.postMessage('destroy'); } catch {}
+      },
+    };
+  } catch (e) {
+    klog.warn('rnnoise', 'suppressor unavailable, using raw mic', { err: e.message });
+    return { stream: rawStream, dispose: () => {} };
+  }
+}
 
 // Restored from 0.1.16 (the last release where calls reliably reached
 // "Connected"). The textbook offer/answer flow:
@@ -689,11 +778,17 @@ class CallManager {
       video: false,
     };
     this._micRaw = await navigator.mediaDevices.getUserMedia(constraints);
+    // RNNoise — drops impulsive non-speech (keyboards, mouse clicks, taps)
+    // that the browser's built-in suppression lets through. Runs before the
+    // amplitude gate so the gate is comparing against already-cleaned audio.
+    const _supp = await wrapStreamWithRnnoise(this._micRaw);
+    this._micSuppressed = _supp.stream;
+    this._micSuppressorDispose = _supp.dispose;
     // Real-time noise gate (optional; reads settings.voice.noiseGate live).
     if (state.settings.voice.noiseGate > 0) {
       try {
         this._micCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = this._micCtx.createMediaStreamSource(this._micRaw);
+        const src = this._micCtx.createMediaStreamSource(this._micSuppressed);
         this._micGate = this._micCtx.createGain();
         this._micGate.gain.value = 1;
         const an = this._micCtx.createAnalyser();
@@ -714,11 +809,11 @@ class CallManager {
         }, 50);
         this.localStream = dest.stream;
       } catch (e) {
-        klog.warn('call.gate', 'failed, using raw mic', { err: e.message });
-        this.localStream = this._micRaw;
+        klog.warn('call.gate', 'failed, using suppressed mic', { err: e.message });
+        this.localStream = this._micSuppressed;
       }
     } else {
-      this.localStream = this._micRaw;
+      this.localStream = this._micSuppressed;
     }
     if (state.globalMicMuted) {
       for (const t of this.localStream.getAudioTracks()) t.enabled = false;
@@ -822,6 +917,8 @@ class CallManager {
     if (this._iceTimeout) { clearTimeout(this._iceTimeout); this._iceTimeout = null; }
     if (this._micGateLoop) { clearInterval(this._micGateLoop); this._micGateLoop = null; }
     if (this._micCtx) { try { this._micCtx.close(); } catch {} this._micCtx = null; this._micGate = null; }
+    if (this._micSuppressorDispose) { try { this._micSuppressorDispose(); } catch {} this._micSuppressorDispose = null; }
+    this._micSuppressed = null;
     if (this._micRaw && this._micRaw !== this.localStream) {
       for (const t of this._micRaw.getTracks()) try { t.stop(); } catch {}
     }
@@ -894,7 +991,7 @@ class MeshSession extends EventTarget {
 
     const v = state.settings.voice;
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
+      this._rawStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: v.inputDeviceId ? { exact: v.inputDeviceId } : undefined,
           noiseSuppression: !!v.noiseSuppression,
@@ -909,6 +1006,9 @@ class MeshSession extends EventTarget {
       alert('Could not access microphone: ' + (e.message || e));
       return false;
     }
+    const _supp = await wrapStreamWithRnnoise(this._rawStream);
+    this.localStream = _supp.stream;
+    this._suppressorDispose = _supp.dispose;
     if (state.globalMicMuted) for (const t of this.localStream.getAudioTracks()) t.enabled = false;
 
     if (!state.realtime || !state.realtime.send({ type: 'room.join', roomId })) {
@@ -1057,6 +1157,11 @@ class MeshSession extends EventTarget {
       try { if (entry.remoteAudio) entry.remoteAudio.remove(); } catch {}
     }
     this.peers.clear();
+    if (this._suppressorDispose) { try { this._suppressorDispose(); } catch {} this._suppressorDispose = null; }
+    if (this._rawStream) {
+      for (const t of this._rawStream.getTracks()) try { t.stop(); } catch {}
+      this._rawStream = null;
+    }
     if (this.localStream) {
       for (const t of this.localStream.getTracks()) try { t.stop(); } catch {}
       this.localStream = null;
@@ -2768,7 +2873,16 @@ function renderDmMessages(dm) {
     const row = buildDmMessageRow(dm, m, showHeader);
     list.appendChild(row);
   }
+  // Pin to bottom. Setting scrollTop synchronously here can read a stale
+  // scrollHeight if the chat container was just unhidden by openDm() —
+  // browser hasn't reflowed yet, so we'd land at the top with history.
+  // Two animation frames: first lets style/layout settle, second confirms
+  // after fonts/avatar images may have shifted size.
   list.scrollTop = list.scrollHeight;
+  requestAnimationFrame(() => {
+    list.scrollTop = list.scrollHeight;
+    requestAnimationFrame(() => { list.scrollTop = list.scrollHeight; });
+  });
 }
 
 // ===========================================================================
@@ -4268,12 +4382,14 @@ function openSettingsModal() {
     const inputVolV   = modal.querySelector('[data-input-vol-value]');
     const outputVol   = modal.querySelector('[data-output-vol]');
     const outputVolV  = modal.querySelector('[data-output-vol-value]');
+    const rnnoise     = modal.querySelector('[data-rnnoise]');
     const noiseSup    = modal.querySelector('[data-noise-suppression]');
     const echoCancel  = modal.querySelector('[data-echo-cancellation]');
     const autoGain    = modal.querySelector('[data-auto-gain]');
 
     inputVol.value  = settings.voice.inputVol;  inputVolV.textContent  = settings.voice.inputVol  + '%';
     outputVol.value = settings.voice.outputVol; outputVolV.textContent = settings.voice.outputVol + '%';
+    if (rnnoise) rnnoise.checked = settings.voice.rnnoise;
     noiseSup.checked   = settings.voice.noiseSuppression;
     echoCancel.checked = settings.voice.echoCancellation;
     autoGain.checked   = settings.voice.autoGain;
@@ -4296,6 +4412,7 @@ function openSettingsModal() {
       settings.voice.outputVol = +outputVol.value; outputVolV.textContent = outputVol.value + '%'; saveSettings();
       if (callMgr.remoteAudio) callMgr.remoteAudio.volume = Math.min(1, settings.voice.outputVol / 100);
     });
+    if (rnnoise) rnnoise.addEventListener('change', () => { settings.voice.rnnoise = rnnoise.checked; saveSettings(); });
     noiseSup.addEventListener('change',   () => { settings.voice.noiseSuppression = noiseSup.checked;   saveSettings(); });
     echoCancel.addEventListener('change', () => { settings.voice.echoCancellation = echoCancel.checked; saveSettings(); });
     autoGain.addEventListener('change',   () => { settings.voice.autoGain         = autoGain.checked;   saveSettings(); });
@@ -4343,23 +4460,25 @@ function openSettingsModal() {
     // analyser so we only get ONE getUserMedia stream — the audio is
     // both metered AND piped to a hidden <audio> element so the user
     // hears themselves.
-    let testCtx = null, testStream = null, testRaf = 0, testLoopAudio = null, testGateGain = null;
+    let testCtx = null, testStream = null, testRawStream = null, testSuppressorDispose = null, testRaf = 0, testLoopAudio = null, testGateGain = null;
     const testBtn      = modal.querySelector('[data-mic-test-btn]');
     const loopbackChk  = modal.querySelector('[data-mic-loopback]');
     const meter        = modal.querySelector('[data-mic-meter]');
     const meterFill    = meter.querySelector('span');
     const stopTest = () => {
-      if (testStream) for (const t of testStream.getTracks()) try { t.stop(); } catch {}
+      if (testSuppressorDispose) { try { testSuppressorDispose(); } catch {} testSuppressorDispose = null; }
+      if (testRawStream) for (const t of testRawStream.getTracks()) try { t.stop(); } catch {}
+      if (testStream && testStream !== testRawStream) for (const t of testStream.getTracks()) try { t.stop(); } catch {}
       if (testCtx) try { testCtx.close(); } catch {}
       if (testLoopAudio) { try { testLoopAudio.pause(); testLoopAudio.srcObject = null; testLoopAudio.remove(); } catch {} }
-      testStream = null; testCtx = null; testLoopAudio = null; testGateGain = null;
+      testStream = null; testRawStream = null; testCtx = null; testLoopAudio = null; testGateGain = null;
       cancelAnimationFrame(testRaf); meterFill.style.width = '0%';
       testBtn.textContent = 'Start test';
     };
     testBtn.addEventListener('click', async () => {
       if (testStream) { stopTest(); return; }
       try {
-        testStream = await navigator.mediaDevices.getUserMedia({
+        testRawStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             deviceId:         settings.voice.inputDeviceId ? { exact: settings.voice.inputDeviceId } : undefined,
             noiseSuppression: !!settings.voice.noiseSuppression,
@@ -4368,6 +4487,9 @@ function openSettingsModal() {
           },
           video: false,
         });
+        const _supp = await wrapStreamWithRnnoise(testRawStream);
+        testStream = _supp.stream;
+        testSuppressorDispose = _supp.dispose;
         testCtx = new (window.AudioContext || window.webkitAudioContext)();
         const src = testCtx.createMediaStreamSource(testStream);
         const an = testCtx.createAnalyser(); an.fftSize = 512;

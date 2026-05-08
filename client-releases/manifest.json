@@ -1,6 +1,6 @@
 {
-  "version": "0.1.32",
-  "releasedAt": "2026-05-07T19:21:20.313Z",
+  "version": "0.1.33",
+  "releasedAt": "2026-05-08T20:58:10.777Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
@@ -9,11 +9,11 @@
     },
     {
       "path": "app.js",
-      "sha256": "bb705179021dfff1fa774ff85a219757a933d55f4f8fb773a2468157f923fd4a"
+      "sha256": "aaa391e20539549f8fcef45c32a92497a2ea16e405a96edc77692b3f80ba49aa"
     },
     {
       "path": "index.html",
-      "sha256": "02f8d3bacd3e5b1749df3b0ac01a0f755c76a72e5e9b8ec4073876edc2a4aafa"
+      "sha256": "8449a9f9c3f8d2b6262416efc00fe44f12c0f15c23237245b567539bf0493a87"
     },
     {
       "path": "sounds/dialing.mp3",
@@ -26,7 +26,19 @@
     {
       "path": "styles.css",
       "sha256": "9dd63a13eedba40434a14a2b17c5ac7d9b28ae8ef352a69c418675cadf0bd3a4"
+    },
+    {
+      "path": "vendor/rnnoise/rnnoise.wasm",
+      "sha256": "8b60a2ab88fdae2d1a9f940249d0eb072f28ba8e796f7304347b4e07839c8853"
+    },
+    {
+      "path": "vendor/rnnoise/rnnoise_simd.wasm",
+      "sha256": "8b60a2ab88fdae2d1a9f940249d0eb072f28ba8e796f7304347b4e07839c8853"
+    },
+    {
+      "path": "vendor/rnnoise/workletProcessor.js",
+      "sha256": "7e95f138ff6901a6a246dd29e6be4a1e8e4ada2baf0bcc04dae065745b51ff3d"
     }
   ],
-  "notes": null
+  "notes": "0.1.33: RNNoise voice-only mode (drops keyboards, taps, mouse clicks while keeping voice — toggle in Settings → Voice). DM scroll-to-bottom fix on open with history."
 }
