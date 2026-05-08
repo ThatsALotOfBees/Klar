@@ -603,9 +603,13 @@ function friendshipRow(f, meId) {
   if (!f) return null;
   const otherId = f.user_a === meId ? f.user_b : f.user_a;
   const other = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId);
+  // status is the public-facing label the renderer checks against.
+  // Internally we store 'accepted' but the rest of the codebase uses
+  // 'mutual' as the friendly term for a two-sided friendship.
+  const publicStatus = f.status === 'accepted' ? 'mutual' : f.status;
   return {
     user: other ? publicUser(other) : null,
-    status: f.status,
+    status: publicStatus,
     direction: f.status === 'pending' ? (f.requester_id === meId ? 'outgoing' : 'incoming') : 'mutual',
     createdAt: f.created_at,
     acceptedAt: f.accepted_at || null,
@@ -1233,7 +1237,7 @@ route('POST', /^\/api\/friends\/request$/, async (req, res) => {
     // the request → counter-request flow Just Works.
     if (existing.status === 'pending' && existing.requester_id === other.id) {
       const [a, b] = _sortedPair(me.id, other.id);
-      db.prepare('UPDATE friendships SET status = "accepted", accepted_at = ? WHERE user_a = ? AND user_b = ?')
+      db.prepare("UPDATE friendships SET status = 'accepted', accepted_at = ? WHERE user_a = ? AND user_b = ?")
         .run(Date.now(), a, b);
       const updated = getFriendship(me.id, other.id);
       log.info('friend.accept', 'auto-accepted via reverse-request', { me: me.username, other: other.username });
@@ -1262,7 +1266,7 @@ route('POST', /^\/api\/friends\/([a-f0-9]+)\/accept$/, async (req, res, [, userI
   if (!f || f.status !== 'pending') return sendError(res, 404, 'no pending request from that user');
   if (f.requester_id === me.id)     return sendError(res, 400, 'only the recipient can accept');
   const [a, b] = _sortedPair(me.id, userId);
-  db.prepare('UPDATE friendships SET status = "accepted", accepted_at = ? WHERE user_a = ? AND user_b = ?')
+  db.prepare("UPDATE friendships SET status = 'accepted', accepted_at = ? WHERE user_a = ? AND user_b = ?")
     .run(Date.now(), a, b);
   const updated = getFriendship(me.id, userId);
   log.info('friend.accept', 'accepted', { me: me.username, other: userId.slice(0, 8) });

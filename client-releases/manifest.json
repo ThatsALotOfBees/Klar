@@ -1,6 +1,6 @@
 {
-  "version": "0.1.37",
-  "releasedAt": "2026-05-08T22:30:51.961Z",
+  "version": "0.1.38",
+  "releasedAt": "2026-05-08T22:39:54.809Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
@@ -40,5 +40,5 @@
       "sha256": "7e95f138ff6901a6a246dd29e6be4a1e8e4ada2baf0bcc04dae065745b51ff3d"
     }
   ],
-  "notes": "0.1.37: Discord-style server sidebar — categories, full right-click menus, channel topics, edit-channel modal, voice user limits + degradation warning above ~12, channel mute, mark-as-read, Ctrl+K quick switcher across DMs/friends/channels. Voice channels were unhidden in the create-channel modal (the 'coming soon' label was stale)."
+  "notes": "0.1.38: friend-accept bugfix discovered by multi-client integration tests. The accept SQL was double-quoting 'accepted' which SQLite parses as a column identifier, so accepts errored 500 on the server. Plus friendshipRow now returns status:'mutual' instead of 'accepted' — the renderer was checking for 'mutual' all along. Both fixes are server-side; redeploy server.js to take effect."
 }
