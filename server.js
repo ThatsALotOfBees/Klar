@@ -158,6 +158,19 @@ CREATE TABLE IF NOT EXISTS channels (
 );
 CREATE INDEX IF NOT EXISTS idx_channels_server ON channels(server_id, position);
 
+-- Discord-style channel categories. Each category groups channels in the
+-- server sidebar; channels with category_id = NULL float above all
+-- categories. position orders categories within a server.
+CREATE TABLE IF NOT EXISTS channel_categories (
+  id TEXT PRIMARY KEY,
+  server_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_chcat_server ON channel_categories(server_id, position);
+
 CREATE TABLE IF NOT EXISTS channel_messages (
   id TEXT PRIMARY KEY,
   channel_id TEXT NOT NULL,
@@ -264,6 +277,15 @@ addColumnIfMissing('messages',         'group_chat_id', 'TEXT');
 // 'text' | 'announcement' | 'voice'. Voice channels are persistent
 // rooms — joining = entering a mesh call scoped to the channel.
 addColumnIfMissing('channels',         'kind',        "TEXT NOT NULL DEFAULT 'text'");
+// Channel categories (Discord-style). category_id NULL means "uncategorized"
+// — those render at the top of the server sidebar above all categories.
+// topic is the small description shown in the chat header. user_limit is
+// advisory for voice channels: 0 = no soft cap, otherwise a warning shows
+// when occupancy approaches it (mesh degrades fast above ~12 active
+// speakers, so the default sane cap is 12 unless owner overrides).
+addColumnIfMissing('channels',         'category_id',  'TEXT');
+addColumnIfMissing('channels',         'topic',        'TEXT');
+addColumnIfMissing('channels',         'user_limit',   'INTEGER NOT NULL DEFAULT 0');
 
 db.exec(`
   -- placeholder so the surrounding template literal terminator stays valid
@@ -523,6 +545,9 @@ function channelRow(c) {
     name: c.name,
     kind: c.kind || 'text',
     position: c.position,
+    categoryId: c.category_id || null,
+    topic: c.topic || '',
+    userLimit: c.user_limit || 0,
     createdAt: c.created_at,
   };
   if (out.kind === 'voice') {
@@ -532,6 +557,17 @@ function channelRow(c) {
     out.voiceMembers = roomMembers(c.id);
   }
   return out;
+}
+
+function categoryRow(cat) {
+  if (!cat) return null;
+  return {
+    id: cat.id,
+    serverId: cat.server_id,
+    name: cat.name,
+    position: cat.position,
+    createdAt: cat.created_at,
+  };
 }
 
 // Block lookups. blocks(blocker_id, blocked_id) — directional. We treat
@@ -1714,6 +1750,7 @@ route('GET', /^\/api\/servers\/([a-f0-9]+)$/, async (req, res, [, serverId]) => 
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(serverId);
   if (!server) return sendError(res, 404, 'server not found');
   const channels = db.prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position ASC, created_at ASC').all(serverId);
+  const categories = db.prepare('SELECT * FROM channel_categories WHERE server_id = ? ORDER BY position ASC, created_at ASC').all(serverId);
   const members = db.prepare(`
     SELECT u.* FROM users u
     JOIN server_members m ON m.user_id = u.id
@@ -1723,6 +1760,7 @@ route('GET', /^\/api\/servers\/([a-f0-9]+)$/, async (req, res, [, serverId]) => 
   send(res, 200, {
     server: publicServer(server),
     channels: channels.map(channelRow),
+    categories: categories.map(categoryRow),
     members: members.map(publicUser),
   });
 });
@@ -1759,11 +1797,19 @@ route('POST', /^\/api\/servers\/([a-f0-9]+)\/channels$/, async (req, res, [, ser
   const kind = (body.kind === 'announcement') ? 'announcement'
              : (body.kind === 'voice')        ? 'voice'
              : 'text';
+  // Optional category — must belong to this server if provided. Bad
+  // category id silently drops to uncategorized so a stale UI never
+  // hard-errors a creation.
+  let categoryId = null;
+  if (typeof body.categoryId === 'string' && body.categoryId) {
+    const cat = db.prepare('SELECT id FROM channel_categories WHERE id = ? AND server_id = ?').get(body.categoryId, serverId);
+    if (cat) categoryId = cat.id;
+  }
   const id = newId();
   const now = Date.now();
   const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM channels WHERE server_id = ?').get(serverId).p;
-  db.prepare('INSERT INTO channels (id, server_id, name, kind, position, created_at) VALUES (?,?,?,?,?,?)')
-    .run(id, serverId, candidate, kind, maxPos + 1, now);
+  db.prepare('INSERT INTO channels (id, server_id, name, kind, position, category_id, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(id, serverId, candidate, kind, maxPos + 1, categoryId, now);
   const ch = db.prepare('SELECT * FROM channels WHERE id = ?').get(id);
   log.info('channel.create', 'new channel', { server: serverId, channel: id, name: candidate, kind, by: me.username });
   const payload = { type: 'channel_created', channel: channelRow(ch) };
@@ -1790,6 +1836,24 @@ route('PATCH', /^\/api\/channels\/([a-f0-9]+)$/, async (req, res, [, channelId])
             : 'text';
     updates.push('kind = ?'); args.push(k);
   }
+  if (typeof body.topic === 'string') {
+    updates.push('topic = ?'); args.push(body.topic.slice(0, 1024));
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'categoryId')) {
+    let cid = null;
+    if (typeof body.categoryId === 'string' && body.categoryId) {
+      const cat = db.prepare('SELECT id FROM channel_categories WHERE id = ? AND server_id = ?').get(body.categoryId, ch.server_id);
+      if (cat) cid = cat.id;
+    }
+    updates.push('category_id = ?'); args.push(cid);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'userLimit')) {
+    const n = Math.max(0, Math.min(99, Number(body.userLimit) || 0));
+    updates.push('user_limit = ?'); args.push(n);
+  }
+  if (typeof body.position === 'number') {
+    updates.push('position = ?'); args.push(Math.max(0, Math.floor(body.position)));
+  }
   if (!updates.length) return sendError(res, 400, 'no updatable fields');
   args.push(channelId);
   db.prepare(`UPDATE channels SET ${updates.join(', ')} WHERE id = ?`).run(...args);
@@ -1811,6 +1875,70 @@ route('DELETE', /^\/api\/channels\/([a-f0-9]+)$/, async (req, res, [, channelId]
   db.prepare('DELETE FROM channels WHERE id = ?').run(channelId);
   log.info('channel.delete', 'deleted', { channel: channelId, by: me.username });
   broadcastToServer(ch.server_id, { type: 'channel_deleted', serverId: ch.server_id, channelId });
+  send(res, 200, { ok: true });
+});
+
+// ---- Channel categories ----
+//
+// Discord-style sidebar groups. Owner-only mutation. Deleting a category
+// re-parents its channels to NULL (uncategorized) instead of cascading,
+// so a misclick doesn't nuke a server's channels.
+const CATEGORY_NAME_RE = /^.{1,40}$/;
+
+route('POST', /^\/api\/servers\/([a-f0-9]+)\/categories$/, async (req, res, [, serverId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  if (!userOwnsServer(me.id, serverId)) return sendError(res, 403, 'only the owner can create categories');
+  const body = await readJson(req);
+  const name = (body.name || '').toString().trim();
+  if (!CATEGORY_NAME_RE.test(name)) return sendError(res, 400, 'name must be 1-40 chars');
+  const id = newId();
+  const now = Date.now();
+  const maxPos = db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM channel_categories WHERE server_id = ?').get(serverId).p;
+  db.prepare('INSERT INTO channel_categories (id, server_id, name, position, created_at) VALUES (?,?,?,?,?)')
+    .run(id, serverId, name, maxPos + 1, now);
+  const cat = db.prepare('SELECT * FROM channel_categories WHERE id = ?').get(id);
+  log.info('category.create', 'new category', { server: serverId, category: id, name, by: me.username });
+  broadcastToServer(serverId, { type: 'category_created', category: categoryRow(cat) });
+  send(res, 200, { category: categoryRow(cat) });
+});
+
+route('PATCH', /^\/api\/categories\/([a-f0-9]+)$/, async (req, res, [, categoryId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const cat = db.prepare('SELECT * FROM channel_categories WHERE id = ?').get(categoryId);
+  if (!cat) return sendError(res, 404, 'category not found');
+  if (!userOwnsServer(me.id, cat.server_id)) return sendError(res, 403, 'only the owner can edit categories');
+  const body = await readJson(req);
+  const updates = []; const args = [];
+  if (typeof body.name === 'string') {
+    const n = body.name.trim();
+    if (!CATEGORY_NAME_RE.test(n)) return sendError(res, 400, 'name must be 1-40 chars');
+    updates.push('name = ?'); args.push(n);
+  }
+  if (typeof body.position === 'number') {
+    updates.push('position = ?'); args.push(Math.max(0, Math.floor(body.position)));
+  }
+  if (!updates.length) return sendError(res, 400, 'no updatable fields');
+  args.push(categoryId);
+  db.prepare(`UPDATE channel_categories SET ${updates.join(', ')} WHERE id = ?`).run(...args);
+  const updated = db.prepare('SELECT * FROM channel_categories WHERE id = ?').get(categoryId);
+  log.info('category.update', 'edited', { category: categoryId, by: me.username });
+  broadcastToServer(cat.server_id, { type: 'category_updated', category: categoryRow(updated) });
+  send(res, 200, { category: categoryRow(updated) });
+});
+
+route('DELETE', /^\/api\/categories\/([a-f0-9]+)$/, async (req, res, [, categoryId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const cat = db.prepare('SELECT * FROM channel_categories WHERE id = ?').get(categoryId);
+  if (!cat) return sendError(res, 404, 'category not found');
+  if (!userOwnsServer(me.id, cat.server_id)) return sendError(res, 403, 'only the owner can delete categories');
+  // Re-parent channels to uncategorized rather than cascade-delete.
+  db.prepare('UPDATE channels SET category_id = NULL WHERE category_id = ?').run(categoryId);
+  db.prepare('DELETE FROM channel_categories WHERE id = ?').run(categoryId);
+  log.info('category.delete', 'deleted', { category: categoryId, by: me.username });
+  broadcastToServer(cat.server_id, { type: 'category_deleted', serverId: cat.server_id, categoryId });
   send(res, 200, { ok: true });
 });
 

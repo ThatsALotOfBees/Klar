@@ -1,19 +1,19 @@
 {
-  "version": "0.1.36",
-  "releasedAt": "2026-05-08T22:17:49.434Z",
+  "version": "0.1.37",
+  "releasedAt": "2026-05-08T22:30:51.961Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",
-      "sha256": "eab67fee8b5a7308ccad8c941c53eb31aa09a31616d82dad528f9684c399732d"
+      "sha256": "9f9f9afc833ba3ac374fc06841964370d321dce2b4b92142c3229cd82732feb3"
     },
     {
       "path": "app.js",
-      "sha256": "0773ead07df3e06559a48f1da1fc1e0ad3dfef7969de577c8f3cc6d5626ac8eb"
+      "sha256": "f8a4ec2b162b4b0f5aa5e1fcf9a30483c2921ba14809366e8452d1e1a5f2c65b"
     },
     {
       "path": "index.html",
-      "sha256": "c127d8d4d5f22d531f3d9a6cf129f4abea9bca398f50b4cc32d81d274f905909"
+      "sha256": "a2e9dad19b7113bf29d696e972cec855fb25f4186aa8c398e773d86c10739921"
     },
     {
       "path": "sounds/dialing.mp3",
@@ -25,7 +25,7 @@
     },
     {
       "path": "styles.css",
-      "sha256": "d140aa581dd3ba7cb66528d757251b9459569dfe0364c5f9a101b01e5de2ea59"
+      "sha256": "1e16046dfdb8cae8d2c85bd906841e65b200dc0941ae27bc133deecbabed8df9"
     },
     {
       "path": "vendor/rnnoise/rnnoise.wasm",
@@ -40,5 +40,5 @@
       "sha256": "7e95f138ff6901a6a246dd29e6be4a1e8e4ada2baf0bcc04dae065745b51ff3d"
     }
   ],
-  "notes": "0.1.36: QoL pass — 13 bug + UX fixes around the new MP3 player, friend system, and voice settings. Voice-only mode toggle now applies live mid-call. Friends modal closes on Esc, accepts @-prefixes, has type-ahead search. Per-peer volume slider clamped to actual range. Not-friends banner clears on view switch and on accept; gains a Block secondary action. Mp3 players auto-pause each other. Home rail shows a red dot when you have pending friend requests."
+  "notes": "0.1.37: Discord-style server sidebar — categories, full right-click menus, channel topics, edit-channel modal, voice user limits + degradation warning above ~12, channel mute, mark-as-read, Ctrl+K quick switcher across DMs/friends/channels. Voice channels were unhidden in the create-channel modal (the 'coming soon' label was stale)."
 }

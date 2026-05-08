@@ -1852,6 +1852,14 @@ function comboToLabel(combo) {
 
 function setupHotkeys() {
   document.addEventListener('keydown', (e) => {
+    // Ctrl/Cmd+K — quick switcher. Doesn't go through the user-defined
+    // hotkey map because it's a built-in jump-to action that competes
+    // for the same combo as Discord's, so we hard-wire it.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.code === 'KeyK') {
+      e.preventDefault();
+      openQuickSwitcher();
+      return;
+    }
     const combo = comboFromEvent(e);
     if (!combo) return;
     const hk = state.settings && state.settings.hotkeys;
@@ -2216,6 +2224,9 @@ function enterApp() {
   state.realtime.addEventListener('channel_created',     (e) => onRemoteChannelCreated(e.detail.channel));
   state.realtime.addEventListener('channel_updated',     (e) => onRemoteChannelUpdated(e.detail.channel));
   state.realtime.addEventListener('channel_deleted',     (e) => onRemoteChannelDeleted(e.detail));
+  state.realtime.addEventListener('category_created',    (e) => onRemoteCategoryCreated(e.detail.category));
+  state.realtime.addEventListener('category_updated',    (e) => onRemoteCategoryUpdated(e.detail.category));
+  state.realtime.addEventListener('category_deleted',    (e) => onRemoteCategoryDeleted(e.detail));
   state.realtime.addEventListener('message_deleted',         (e) => onRemoteMessageDeleted(e.detail));
   state.realtime.addEventListener('channel_message_deleted', (e) => onRemoteChannelMessageDeleted(e.detail));
   state.realtime.addEventListener('block_updated',       (e) => onRemoteBlockUpdated(e.detail));
@@ -3094,6 +3105,14 @@ async function renderServerSidebar(serverId) {
   }
 }
 
+function _categoryCollapseKey(cid) { return 'klar.cat.collapsed.' + cid; }
+function _isCategoryCollapsed(cid) { try { return localStorage.getItem(_categoryCollapseKey(cid)) === '1'; } catch { return false; } }
+function _setCategoryCollapsed(cid, collapsed) { try { localStorage.setItem(_categoryCollapseKey(cid), collapsed ? '1' : '0'); } catch {} }
+
+// Render the server's channel list grouped by category. Layout mirrors
+// Discord: uncategorized channels float at the top, then each category
+// header (collapsible) followed by its channels. Right-click anywhere
+// for create/edit/delete.
 function renderChannelList(serverId) {
   const ul = root.querySelector('[data-channel-list]');
   if (!ul) return;
@@ -3101,56 +3120,126 @@ function renderChannelList(serverId) {
   const detail = state.serverDetails.get(serverId);
   if (!detail) return;
 
-  // Single category for the MVP — server-side has no category concept yet.
-  const cat = document.createElement('li');
-  cat.className = 'channel-category';
-  cat.textContent = 'OPEN COMMS';
-  ul.appendChild(cat);
-
   const meOwns = detail.server.ownerId === state.user.id;
-
+  const cats = Array.isArray(detail.categories) ? detail.categories : [];
+  const channelsByCat = new Map();
+  channelsByCat.set(null, []);
+  for (const c of cats) channelsByCat.set(c.id, []);
   for (const ch of detail.channels) {
-    const isVoice = ch.kind === 'voice';
-    const inThisVoice = isVoice && state.mesh && state.mesh.scope === ch.id;
-    const li = document.createElement('li');
-    li.className = 'channel-item'
-      + (ch.id === state.activeChannelId && !isVoice ? ' active' : '')
-      + (ch.kind === 'announcement' ? ' announcement' : '')
-      + (isVoice ? ' voice' : '')
-      + (inThisVoice ? ' joined' : '');
-    li.innerHTML = `<span class="channel-icon"></span><span class="channel-name"></span>`;
-    const iconId = isVoice ? 'klar-headphones' : ch.kind === 'announcement' ? 'klar-mic' : 'klar-hash';
-    li.querySelector('.channel-icon').appendChild(svgIcon(iconId, 18));
-    li.querySelector('.channel-name').textContent = ch.name;
-    li.addEventListener('click', () => {
-      if (isVoice) joinVoiceChannel(ch);
-      else openChannel(ch.id);
-    });
-    li.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      openChannelContextMenu(e.clientX, e.clientY, ch, meOwns, serverId);
-    });
-    ul.appendChild(li);
+    const cid = ch.categoryId && channelsByCat.has(ch.categoryId) ? ch.categoryId : null;
+    channelsByCat.get(cid).push(ch);
+  }
+  // Sort each bucket by position, then created_at as tiebreaker.
+  for (const list of channelsByCat.values()) {
+    list.sort((a, b) => (a.position - b.position) || (a.createdAt - b.createdAt));
+  }
 
-    // For voice channels, render the current member list as nested rows
-    // beneath the channel itself.
-    if (isVoice) {
-      const present = state.voiceChannelMembers.get(ch.id);
-      const members = present ? Array.from(present) : (Array.isArray(ch.voiceMembers) ? ch.voiceMembers : []);
-      if (members.length) {
-        const sub = document.createElement('li');
-        sub.className = 'voice-members';
-        for (const uid of members) {
-          const u = userById(uid) || { id: uid, displayName: '?', username: '?' };
-          const row = document.createElement('div');
-          row.className = 'voice-member';
-          row.innerHTML = `<div class="avatar"></div><div class="name"></div>`;
-          paintAvatar(row.querySelector('.avatar'), u);
-          row.querySelector('.name').textContent = u.displayName || u.username;
-          sub.appendChild(row);
-        }
-        ul.appendChild(sub);
+  // Uncategorized channels first.
+  for (const ch of channelsByCat.get(null)) renderChannelRow(ul, ch, serverId, meOwns);
+
+  // Then categories in their order.
+  for (const cat of cats.slice().sort((a, b) => (a.position - b.position) || (a.createdAt - b.createdAt))) {
+    const collapsed = _isCategoryCollapsed(cat.id);
+    const header = document.createElement('li');
+    header.className = 'channel-category' + (collapsed ? ' collapsed' : '');
+    header.innerHTML = `<span class="cat-caret">▾</span><span class="cat-name"></span>${meOwns ? '<button class="cat-add" title="Create channel" aria-label="Create channel">+</button>' : ''}`;
+    header.querySelector('.cat-name').textContent = cat.name.toUpperCase();
+    header.addEventListener('click', (e) => {
+      // Don't toggle when clicking the + button.
+      if (e.target.closest('.cat-add')) return;
+      const next = !_isCategoryCollapsed(cat.id);
+      _setCategoryCollapsed(cat.id, next);
+      renderChannelList(serverId);
+    });
+    header.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openCategoryContextMenu(e.clientX, e.clientY, cat, meOwns, serverId);
+    });
+    const addBtn = header.querySelector('.cat-add');
+    if (addBtn) addBtn.addEventListener('click', (e) => { e.stopPropagation(); openCreateChannelModal(serverId, cat.id); });
+    ul.appendChild(header);
+
+    if (!collapsed) {
+      for (const ch of channelsByCat.get(cat.id)) renderChannelRow(ul, ch, serverId, meOwns);
+    }
+  }
+
+  // Owner can right-click empty space to create. We give the bottom of
+  // the list a generous click target so the menu is reachable even when
+  // the channel list is short.
+  if (meOwns) {
+    const spacer = document.createElement('li');
+    spacer.className = 'channel-list-spacer';
+    spacer.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openSidebarContextMenu(e.clientX, e.clientY, serverId);
+    });
+    ul.appendChild(spacer);
+    // Also let right-click on the ul itself bubble up to the menu so any
+    // gap between channels works as a target.
+    if (!ul.dataset.ctxWired) {
+      ul.dataset.ctxWired = '1';
+      ul.addEventListener('contextmenu', (e) => {
+        if (e.target !== ul && !e.target.classList.contains('channel-list-spacer')) return;
+        e.preventDefault();
+        openSidebarContextMenu(e.clientX, e.clientY, serverId);
+      });
+    }
+  }
+}
+
+function renderChannelRow(ul, ch, serverId, meOwns) {
+  const isVoice = ch.kind === 'voice';
+  const inThisVoice = isVoice && state.mesh && state.mesh.scope === ch.id;
+  const li = document.createElement('li');
+  li.className = 'channel-item'
+    + (ch.id === state.activeChannelId && !isVoice ? ' active' : '')
+    + (ch.kind === 'announcement' ? ' announcement' : '')
+    + (isVoice ? ' voice' : '')
+    + (inThisVoice ? ' joined' : '');
+  // Voice user-cap badge: show "<count>/<limit>" or just "<count>" if no
+  // limit. Updates live via voice presence WS events (renderChannelList
+  // is re-called on those).
+  let countMarkup = '';
+  if (isVoice) {
+    const present = state.voiceChannelMembers.get(ch.id);
+    const live = present ? present.size : (Array.isArray(ch.voiceMembers) ? ch.voiceMembers.length : 0);
+    if (live > 0 || ch.userLimit > 0) {
+      countMarkup = `<span class="channel-voice-count">${live}${ch.userLimit > 0 ? '/' + ch.userLimit : ''}</span>`;
+    }
+  }
+  li.innerHTML = `<span class="channel-icon"></span><span class="channel-name"></span>${countMarkup}`;
+  const iconId = isVoice ? 'klar-headphones' : ch.kind === 'announcement' ? 'klar-mic' : 'klar-hash';
+  li.querySelector('.channel-icon').appendChild(svgIcon(iconId, 18));
+  li.querySelector('.channel-name').textContent = ch.name;
+  if (isChannelMuted(ch.id)) li.classList.add('muted');
+  li.addEventListener('click', () => {
+    if (isVoice) joinVoiceChannel(ch);
+    else openChannel(ch.id);
+  });
+  li.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    openChannelContextMenu(e.clientX, e.clientY, ch, meOwns, serverId);
+  });
+  ul.appendChild(li);
+
+  // For voice channels, render the current member list as nested rows.
+  if (isVoice) {
+    const present = state.voiceChannelMembers.get(ch.id);
+    const members = present ? Array.from(present) : (Array.isArray(ch.voiceMembers) ? ch.voiceMembers : []);
+    if (members.length) {
+      const sub = document.createElement('li');
+      sub.className = 'voice-members';
+      for (const uid of members) {
+        const u = userById(uid) || { id: uid, displayName: '?', username: '?' };
+        const row = document.createElement('div');
+        row.className = 'voice-member';
+        row.innerHTML = `<div class="avatar"></div><div class="name"></div>`;
+        paintAvatar(row.querySelector('.avatar'), u);
+        row.querySelector('.name').textContent = u.displayName || u.username;
+        sub.appendChild(row);
       }
+      ul.appendChild(sub);
     }
   }
 }
@@ -3162,6 +3251,18 @@ async function joinVoiceChannel(ch) {
     renderChannelList(ch.serverId);
     return;
   }
+  // Soft user limit + mesh-degradation warning. Voice in Klar is full
+  // mesh — every user uploads to every other user. Above ~12 active
+  // speakers it gets choppy on consumer hardware/internet. We warn but
+  // don't block, since "still works for casual hangouts at higher
+  // counts" is true if everyone has decent upload.
+  const present = state.voiceChannelMembers.get(ch.id);
+  const live = present ? present.size : (Array.isArray(ch.voiceMembers) ? ch.voiceMembers.length : 0);
+  if (ch.userLimit && live >= ch.userLimit) {
+    if (!confirm(`#${ch.name} has reached its user limit (${ch.userLimit}). Join anyway?`)) return;
+  } else if (live >= 12) {
+    if (!confirm(`#${ch.name} already has ${live} people in voice. Klar uses peer-to-peer mesh, which gets choppy above ~12 speakers. Join anyway?`)) return;
+  }
   // If we're in a different mesh (another voice channel), leave it first.
   if (state.mesh) await meshSession.leave();
   const ok = await meshSession.join(ch.id, 'voice-channel', ch.id);
@@ -3172,22 +3273,207 @@ async function joinVoiceChannel(ch) {
 }
 
 function openChannelContextMenu(x, y, channel, meOwns, serverId) {
+  const isVoice = channel.kind === 'voice';
+  const muted = isChannelMuted(channel.id);
   const items = [
-    { label: 'Open',          icon: 'klar-asteroid', onClick: () => openChannel(channel.id) },
-    { divider: true },
+    { label: isVoice ? 'Join' : 'Open', icon: 'klar-asteroid', onClick: () => isVoice ? joinVoiceChannel(channel) : openChannel(channel.id) },
   ];
+  if (!isVoice) {
+    items.push({ label: 'Mark as read', icon: 'klar-check', onClick: () => markChannelRead(channel.id) });
+  }
+  items.push(
+    { label: muted ? 'Unmute channel' : 'Mute channel', icon: muted ? 'klar-mic' : 'klar-mic-off',
+      onClick: () => { setChannelMuted(channel.id, !muted); renderChannelList(serverId); } },
+  );
   if (meOwns) {
     items.push(
-      { label: 'Edit name',           icon: 'klar-settings', onClick: () => openRenameChannelPrompt(channel) },
-      { label: channel.kind === 'announcement' ? 'Convert to text channel' : 'Convert to announcement', icon: 'klar-mic', onClick: () => toggleChannelKind(channel) },
-      { label: 'Generate invite link', icon: 'klar-compass', onClick: () => generateInviteFor(serverId) },
       { divider: true },
-      { label: 'Delete channel',     icon: 'klar-x', danger: true, onClick: () => confirmAndDeleteChannel(channel) },
+      { label: 'Edit channel',         icon: 'klar-settings', onClick: () => openEditChannelModal(channel, serverId) },
+      { label: channel.kind === 'announcement' ? 'Convert to text channel' : 'Convert to announcement',
+        icon: 'klar-mic', onClick: () => toggleChannelKind(channel),
+        hidden: isVoice },
+      { label: 'Generate invite link', icon: 'klar-compass',  onClick: () => generateInviteFor(serverId) },
+      { divider: true },
+      { label: 'Delete channel',       icon: 'klar-x', danger: true, onClick: () => confirmAndDeleteChannel(channel) },
     );
   } else {
+    items.push({ divider: true });
     items.push({ label: 'Generate invite link', icon: 'klar-compass', onClick: () => generateInviteFor(serverId) });
   }
   openContextMenu(x, y, items);
+}
+
+// Right-click on the empty area / spacer of the channel list. Owner-only;
+// non-owners just see nothing happen because there's nothing for them to
+// do here.
+function openSidebarContextMenu(x, y, serverId) {
+  openContextMenu(x, y, [
+    { label: 'Create text channel',   icon: 'klar-hash',       onClick: () => openCreateChannelModal(serverId, null, 'text') },
+    { label: 'Create voice channel',  icon: 'klar-headphones', onClick: () => openCreateChannelModal(serverId, null, 'voice') },
+    { divider: true },
+    { label: 'Create category',       icon: 'klar-plus',       onClick: () => openCreateCategoryPrompt(serverId) },
+  ]);
+}
+
+function openCategoryContextMenu(x, y, category, meOwns, serverId) {
+  if (!meOwns) return;
+  openContextMenu(x, y, [
+    { label: 'Create text channel',  icon: 'klar-hash',       onClick: () => openCreateChannelModal(serverId, category.id, 'text') },
+    { label: 'Create voice channel', icon: 'klar-headphones', onClick: () => openCreateChannelModal(serverId, category.id, 'voice') },
+    { divider: true },
+    { label: 'Rename category',      icon: 'klar-settings',   onClick: () => openRenameCategoryPrompt(category) },
+    { divider: true },
+    { label: 'Delete category',      icon: 'klar-x', danger: true, onClick: () => confirmAndDeleteCategory(category) },
+  ]);
+}
+
+async function openCreateCategoryPrompt(serverId) {
+  const name = prompt('Category name (1–40 chars):', 'New category');
+  if (name == null) return;
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  try { await api.createCategory(serverId, trimmed); }
+  catch (e) { alert('Create failed: ' + (e.message || 'error')); }
+}
+
+async function openRenameCategoryPrompt(category) {
+  const next = prompt('New category name:', category.name);
+  if (next == null) return;
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === category.name) return;
+  try { await api.updateCategory(category.id, { name: trimmed }); }
+  catch (e) { alert('Rename failed: ' + (e.message || 'error')); }
+}
+
+async function confirmAndDeleteCategory(category) {
+  if (!confirm(`Delete category "${category.name}"? Channels inside will move to the top of the list (uncategorized).`)) return;
+  try { await api.deleteCategory(category.id); }
+  catch (e) { alert('Delete failed: ' + (e.message || 'error')); }
+}
+
+// Quick switcher: Ctrl/Cmd+K. Searches across DMs, channels (every
+// joined server), and friends. Arrow keys to navigate, Enter to jump,
+// Escape to close. Filtered live as you type.
+function openQuickSwitcher() {
+  const existing = document.querySelector('[data-quick-switch]');
+  if (existing) { existing.remove(); return; }
+  const wrap = document.createElement('div');
+  wrap.className = 'quick-switch-backdrop';
+  wrap.dataset.quickSwitch = '1';
+  wrap.innerHTML = `
+    <div class="quick-switch">
+      <input type="text" placeholder="Where to? Channels, DMs, friends…" data-qs-input />
+      <ul class="qs-results" data-qs-results></ul>
+      <div class="qs-hint">↑↓ to move · Enter to jump · Esc to cancel</div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  const close = () => { wrap.remove(); document.removeEventListener('keydown', onKey); };
+  const input = wrap.querySelector('[data-qs-input]');
+  const list  = wrap.querySelector('[data-qs-results]');
+
+  // Build the candidate set ONCE on open so arrow-key navigation is
+  // stable. Candidates: DMs, friends not in DMs, every channel from
+  // every joined server.
+  const candidates = [];
+  for (const dm of state.dms) {
+    candidates.push({ kind: 'dm', label: '@' + dm.other.username, sub: dm.other.displayName, action: () => { switchView({ kind: 'home' }); setTimeout(() => openDm(dm.id), 30); } });
+  }
+  const dmUserIds = new Set(state.dms.map((d) => d.other.id));
+  for (const f of state.friends) {
+    if (f.status !== 'mutual' || !f.user || dmUserIds.has(f.user.id)) continue;
+    const u = f.user;
+    candidates.push({ kind: 'friend', label: '@' + u.username, sub: 'friend · open DM', action: async () => {
+      try { const r = await api.createDm(u.id); switchView({ kind: 'home' }); setTimeout(() => openDm(r.dm.id), 30); } catch {}
+    }});
+  }
+  for (const [serverId, detail] of state.serverDetails) {
+    const serverName = detail.server.name;
+    for (const ch of detail.channels) {
+      candidates.push({
+        kind: ch.kind === 'voice' ? 'voice' : 'channel',
+        label: (ch.kind === 'voice' ? '🔊 ' : '#') + ch.name,
+        sub: serverName,
+        action: () => {
+          if (ch.kind === 'voice') joinVoiceChannel(ch);
+          else { switchView({ kind: 'server', serverId }).then(() => openChannel(ch.id)); }
+        },
+      });
+    }
+  }
+
+  let filtered = candidates.slice(0, 10);
+  let active = 0;
+  const render = () => {
+    list.innerHTML = '';
+    filtered.forEach((c, i) => {
+      const li = document.createElement('li');
+      li.className = 'qs-row' + (i === active ? ' active' : '');
+      li.innerHTML = `<span class="qs-kind"></span><span class="qs-label"></span><span class="qs-sub"></span>`;
+      li.querySelector('.qs-kind').textContent = c.kind;
+      li.querySelector('.qs-label').textContent = c.label;
+      li.querySelector('.qs-sub').textContent   = c.sub || '';
+      li.addEventListener('click', () => { c.action(); close(); });
+      li.addEventListener('mouseenter', () => { active = i; render(); });
+      list.appendChild(li);
+    });
+  };
+  render();
+
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    if (!q) filtered = candidates.slice(0, 10);
+    else {
+      const score = (c) => {
+        const l = c.label.toLowerCase();
+        if (l === q || l === '#' + q || l === '@' + q) return 0;
+        if (l.startsWith(q) || l.startsWith('#' + q) || l.startsWith('@' + q)) return 1;
+        if (l.includes(q)) return 2;
+        if ((c.sub || '').toLowerCase().includes(q)) return 3;
+        return 99;
+      };
+      filtered = candidates
+        .map((c) => ({ c, s: score(c) }))
+        .filter((x) => x.s < 99)
+        .sort((a, b) => a.s - b.s)
+        .slice(0, 10)
+        .map((x) => x.c);
+    }
+    active = 0;
+    render();
+  });
+
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); if (filtered.length) { active = (active + 1) % filtered.length; render(); } }
+    else if (e.key === 'ArrowUp')   { e.preventDefault(); if (filtered.length) { active = (active - 1 + filtered.length) % filtered.length; render(); } }
+    else if (e.key === 'Enter')     { e.preventDefault(); if (filtered[active]) { filtered[active].action(); close(); } }
+  };
+  document.addEventListener('keydown', onKey);
+  wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+  setTimeout(() => input.focus(), 30);
+}
+
+// Channel mute is purely client-side state (the server doesn't gate on
+// it). Stored in localStorage as a JSON set; "muted" suppresses notify
+// sounds + dims the channel name in the sidebar.
+function _mutedChannels() {
+  try { return new Set(JSON.parse(localStorage.getItem('klar.mutedChannels') || '[]')); }
+  catch { return new Set(); }
+}
+function isChannelMuted(channelId) { return _mutedChannels().has(channelId); }
+function setChannelMuted(channelId, muted) {
+  const set = _mutedChannels();
+  if (muted) set.add(channelId); else set.delete(channelId);
+  try { localStorage.setItem('klar.mutedChannels', JSON.stringify([...set])); } catch {}
+}
+
+// Mark a channel "read" — local-only acknowledgement for now: clears any
+// unread highlight in the sidebar. The server doesn't track read state
+// yet; this is a UI-only convenience.
+function markChannelRead(channelId) {
+  state.unreadChannels?.delete(channelId);
+  if (state.view.kind === 'server') renderChannelList(state.view.serverId);
 }
 
 async function openRenameChannelPrompt(channel) {
@@ -4332,7 +4618,7 @@ function openChannel(channelId) {
       <span class="channel-hash"></span>
       <span class="channel-name"></span>
     </div>
-    <div class="chat-topic">Open comms — keep it civil, keep it weird</div>
+    <div class="chat-topic" data-channel-topic></div>
     <div class="actions">
       <button class="icon-btn" data-action="toggle-userlist" title="Show member list" aria-label="Toggle member list" aria-pressed="true">
         <svg width="18" height="18"><use href="#klar-users"/></svg>
@@ -4341,6 +4627,12 @@ function openChannel(channelId) {
   `;
   header.querySelector('.channel-hash').appendChild(svgIcon('klar-hash', 20));
   header.querySelector('.channel-name').textContent = ch.name;
+  // Owner-set channel topic if any; otherwise the friendly placeholder.
+  const topicEl = header.querySelector('[data-channel-topic]');
+  topicEl.textContent = ch.topic && ch.topic.trim()
+    ? ch.topic
+    : 'Open comms — keep it civil, keep it weird';
+  topicEl.classList.toggle('placeholder', !(ch.topic && ch.topic.trim()));
   header.querySelector('[data-action="toggle-userlist"]').addEventListener('click', toggleUserlist);
   syncUserlistButton();
 
@@ -4957,6 +5249,42 @@ function onRemoteChannelDeleted(payload) {
         root.querySelector('[data-chat-empty]').classList.remove('hidden');
       }
     }
+  }
+}
+
+function onRemoteCategoryCreated(category) {
+  const detail = state.serverDetails.get(category.serverId);
+  if (!detail) return;
+  if (!Array.isArray(detail.categories)) detail.categories = [];
+  if (detail.categories.find((c) => c.id === category.id)) return;
+  detail.categories.push(category);
+  if (state.view.kind === 'server' && state.view.serverId === category.serverId) {
+    renderChannelList(category.serverId);
+  }
+}
+
+function onRemoteCategoryUpdated(category) {
+  const detail = state.serverDetails.get(category.serverId);
+  if (!detail || !Array.isArray(detail.categories)) return;
+  const idx = detail.categories.findIndex((c) => c.id === category.id);
+  if (idx >= 0) detail.categories[idx] = category;
+  if (state.view.kind === 'server' && state.view.serverId === category.serverId) {
+    renderChannelList(category.serverId);
+  }
+}
+
+function onRemoteCategoryDeleted(payload) {
+  const detail = state.serverDetails.get(payload.serverId);
+  if (!detail) return;
+  if (Array.isArray(detail.categories)) {
+    detail.categories = detail.categories.filter((c) => c.id !== payload.categoryId);
+  }
+  // Re-parent any channels that referenced this category to uncategorized.
+  for (const ch of detail.channels) {
+    if (ch.categoryId === payload.categoryId) ch.categoryId = null;
+  }
+  if (state.view.kind === 'server' && state.view.serverId === payload.serverId) {
+    renderChannelList(payload.serverId);
   }
 }
 
@@ -5704,9 +6032,23 @@ function openJoinServerModal() {
   });
 }
 
-function openCreateChannelModal(serverId) {
+function openCreateChannelModal(serverId, categoryId, defaultKind) {
   openModal('tpl-modal-create-channel', (modal, close) => {
     const form = modal.querySelector('[data-form="create-channel"]');
+    if (defaultKind) {
+      const radio = form.querySelector(`input[name="kind"][value="${defaultKind}"]`);
+      if (radio) radio.checked = true;
+    }
+    // Show the target category in the title for clarity ("New channel in
+    // GAMING" vs the bare "New channel").
+    if (categoryId) {
+      const detail = state.serverDetails.get(serverId);
+      const cat = detail?.categories?.find((c) => c.id === categoryId);
+      if (cat) {
+        const h2 = modal.querySelector('h2');
+        if (h2) h2.textContent = `New channel in ${cat.name}`;
+      }
+    }
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       showModalError(modal, null);
@@ -5714,18 +6056,99 @@ function openCreateChannelModal(serverId) {
       const name = fd.get('name').toString().trim().toLowerCase();
       const kind = (fd.get('kind') || 'text').toString();
       try {
-        const { channel } = await api.createChannel(serverId, name, kind);
+        const { channel } = await api.createChannel(serverId, name, kind, categoryId);
         const detail = state.serverDetails.get(serverId);
         if (detail) {
           if (!detail.channels.find((c) => c.id === channel.id)) detail.channels.push(channel);
           renderChannelList(serverId);
         }
         close();
-        openChannel(channel.id);
+        if (kind === 'voice') joinVoiceChannel(channel);
+        else openChannel(channel.id);
       } catch (err) {
         showModalError(modal, err.message || 'failed to create channel');
       }
     });
+  });
+}
+
+// Edit-channel modal (owner-only). Lets the owner rename, change topic,
+// move to a category (or uncategorized), and set a soft user-limit on
+// voice channels.
+function openEditChannelModal(channel, serverId) {
+  const detail = state.serverDetails.get(serverId);
+  if (!detail) return;
+  const cats = detail.categories || [];
+  const isVoice = channel.kind === 'voice';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-backdrop';
+  wrap.dataset.modal = '1';
+  wrap.innerHTML = `
+    <div class="modal">
+      <h2>Edit ${isVoice ? '🔊' : '#'} ${channel.name}</h2>
+      <form data-form="edit-channel">
+        <label>Channel name
+          <input name="name" pattern="[a-z0-9][a-z0-9_\\-]*" maxlength="32" required />
+        </label>
+        <label>Topic <span class="muted small">(shown above the messages list)</span>
+          <input name="topic" maxlength="1024" />
+        </label>
+        <label>Category
+          <select name="categoryId">
+            <option value="">Uncategorized</option>
+          </select>
+        </label>
+        ${isVoice ? `
+        <label>User limit <span class="muted small">(0 = no soft cap; mesh voice degrades above ~12)</span>
+          <input name="userLimit" type="number" min="0" max="99" />
+        </label>` : ''}
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-cancel>Cancel</button>
+          <button type="submit">Save</button>
+        </div>
+      </form>
+      <div class="error" data-error hidden></div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  const close = () => { wrap.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+  wrap.querySelector('[data-cancel]').addEventListener('click', close);
+
+  const form = wrap.querySelector('[data-form="edit-channel"]');
+  form.name.value = channel.name;
+  form.topic.value = channel.topic || '';
+  if (isVoice) form.userLimit.value = String(channel.userLimit ?? 0);
+  const sel = form.categoryId;
+  for (const c of cats) {
+    const opt = document.createElement('option');
+    opt.value = c.id; opt.textContent = c.name;
+    if (channel.categoryId === c.id) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  if (!channel.categoryId) sel.value = '';
+
+  const errEl = wrap.querySelector('[data-error]');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errEl.hidden = true;
+    const patch = {
+      name: form.name.value.trim().toLowerCase(),
+      topic: form.topic.value.trim(),
+      categoryId: form.categoryId.value || null,
+    };
+    if (isVoice) patch.userLimit = Number(form.userLimit.value) || 0;
+    try {
+      await api.updateChannel(channel.id, patch);
+      close();
+    } catch (err) {
+      errEl.hidden = false;
+      errEl.textContent = err.message || 'failed';
+    }
   });
 }
 
