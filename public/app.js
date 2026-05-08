@@ -278,17 +278,31 @@ const ICE_CONFIG = {
   iceCandidatePoolSize: 4,
 };
 
-// ---------- RNNoise-based mic suppressor ----------
+// ---------- Mic processing pipeline (RNNoise + gate + gain + analyser) ----------
 //
-// WebRTC's built-in noiseSuppression handles steady-state noise (fans, hum)
-// but lets impulsive sounds (keyboard clicks, taps, mouse buttons) right
-// through. RNNoise is a small neural net trained on speech vs. non-speech
-// 48 kHz frames; it's specifically good at the impulsive stuff. We vendor
-// the worklet + wasm under public/vendor/rnnoise/ so there's no runtime
-// network fetch and no bundler. wrapStreamWithRnnoise() returns a denoised
-// MediaStream; the rest of the audio graph (gate, peer connection, loopback
-// meter) attaches to that. On any failure we fall back to the raw stream so
-// a busted suppressor never breaks a call.
+// One shared graph that owns the entire mic-to-peer audio chain so every
+// stage (noise suppression, input volume, noise gate, speaking-detection
+// analyser, MediaStreamDestination feeding the RTCPeerConnection) lives in
+// the same AudioContext. That matters because:
+//
+//   1. WebRTC's built-in noiseSuppression handles steady-state noise (fans,
+//      hum) but lets impulsive sounds (keyboard clicks, taps, mouse
+//      buttons) right through. RNNoise is trained on 48 kHz speech vs.
+//      non-speech frames and drops those impulsives. We vendor the worklet
+//      + wasm under public/vendor/rnnoise/ — no runtime network fetch,
+//      no bundler.
+//
+//   2. The speaking indicator must read post-suppression audio. Otherwise
+//      keystrokes light up the indicator even though the peer can't hear
+//      them. Tying the analyser into the same graph guarantees that.
+//
+//   3. The input-volume slider, the noise-gate slider, and the speaking
+//      indicator all need to read the same setting state in real time.
+//      Single graph + a single 50 ms loop reads settings.voice live, no
+//      "settings only apply on next call" footgun.
+//
+// On any failure the pipeline still routes raw mic → gain → gate → output
+// so calls never break — only suppression goes away.
 
 const RNNOISE_PROCESSOR_NAME = '@sapphi-red/web-noise-suppressor/rnnoise';
 const RNNOISE_WORKLET_URL = new URL('./vendor/rnnoise/workletProcessor.js', import.meta.url);
@@ -321,7 +335,7 @@ async function _ensureRnnoiseAssets(ctx) {
   await _rnnoiseWorkletReady;
 }
 
-function _getRnnoiseCtx() {
+function _getMicCtx() {
   if (!_rnnoiseSharedCtx || _rnnoiseSharedCtx.state === 'closed') {
     _rnnoiseSharedCtx = new (window.AudioContext || window.webkitAudioContext)({
       sampleRate: 48000,
@@ -330,40 +344,128 @@ function _getRnnoiseCtx() {
   return _rnnoiseSharedCtx;
 }
 
-// Returns { stream, dispose() }. If suppression is disabled or fails, stream
-// === rawStream and dispose is a no-op.
-async function wrapStreamWithRnnoise(rawStream) {
-  if (!state.settings.voice.rnnoise) {
-    return { stream: rawStream, dispose: () => {} };
+// Track every active pipeline so settings sliders can update them live.
+const _activeMicPipelines = new Set();
+
+class MicPipeline {
+  constructor(rawStream) {
+    this.rawStream = rawStream;
+    this.ctx = null;
+    this.src = null;
+    this.suppressor = null;
+    this.inputGain = null;
+    this.gateGain = null;
+    this.analyser = null;
+    this.destination = null;
+    this._loop = null;
+    this._buf = null;
+    this._destroyed = false;
+    this.usingRnnoise = false;
   }
+
+  async build() {
+    const wantRnnoise = !!state.settings.voice.rnnoise;
+    this.ctx = _getMicCtx();
+    if (this.ctx.state === 'suspended') {
+      try { await this.ctx.resume(); } catch {}
+    }
+    if (wantRnnoise) {
+      try {
+        await _ensureRnnoiseAssets(this.ctx);
+        this.usingRnnoise = true;
+      } catch (e) {
+        klog.warn('mic.rnnoise', 'asset load failed, suppressor off', { err: e.message });
+      }
+    }
+
+    this.src = this.ctx.createMediaStreamSource(this.rawStream);
+    this.inputGain = this.ctx.createGain();
+    this.gateGain = this.ctx.createGain();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 512;
+    this._buf = new Uint8Array(this.analyser.frequencyBinCount);
+    this.destination = this.ctx.createMediaStreamDestination();
+
+    let upstream = this.src;
+    if (this.usingRnnoise) {
+      try {
+        // wasmBinary is structured-cloned to the worklet; pass a copy.
+        this.suppressor = new AudioWorkletNode(this.ctx, RNNOISE_PROCESSOR_NAME, {
+          processorOptions: { maxChannels: 1, wasmBinary: _rnnoiseWasmBytes.slice(0) },
+        });
+        this.src.connect(this.suppressor);
+        upstream = this.suppressor;
+        klog.info('mic.rnnoise', 'suppressor instantiated');
+      } catch (e) {
+        klog.warn('mic.rnnoise', 'worklet instantiate failed', { err: e.message });
+        this.usingRnnoise = false;
+      }
+    }
+
+    upstream.connect(this.inputGain);
+    this.inputGain.connect(this.gateGain);
+    this.gateGain.connect(this.analyser);
+    this.analyser.connect(this.destination);
+
+    // Initial gain values — read live state.
+    this.inputGain.gain.value = (state.settings.voice.inputVol ?? 100) / 100;
+    this.gateGain.gain.value = 1;
+
+    // Settings tick: input volume + noise gate read live so sliders take
+    // effect mid-call without a teardown/rebuild. setTargetAtTime gives a
+    // short ramp so the gate doesn't click open/closed.
+    this._loop = setInterval(() => {
+      if (this._destroyed) return;
+      const inputVol = (state.settings.voice.inputVol ?? 100) / 100;
+      this.inputGain.gain.setTargetAtTime(inputVol, this.ctx.currentTime, 0.01);
+
+      const threshold = state.settings.voice.noiseGate || 0;
+      if (threshold <= 0) {
+        this.gateGain.gain.setTargetAtTime(1, this.ctx.currentTime, 0.005);
+      } else {
+        this.analyser.getByteFrequencyData(this._buf);
+        let sum = 0; for (const v of this._buf) sum += v;
+        const avg = sum / this._buf.length;
+        const target = avg < threshold ? 0 : 1;
+        this.gateGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.025);
+      }
+    }, 50);
+
+    _activeMicPipelines.add(this);
+    return this;
+  }
+
+  get stream() { return this.destination?.stream; }
+
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    _activeMicPipelines.delete(this);
+    if (this._loop) { clearInterval(this._loop); this._loop = null; }
+    try { this.suppressor?.port.postMessage('destroy'); } catch {}
+    try { this.suppressor?.disconnect(); } catch {}
+    try { this.src?.disconnect(); } catch {}
+    try { this.inputGain?.disconnect(); } catch {}
+    try { this.gateGain?.disconnect(); } catch {}
+    try { this.analyser?.disconnect(); } catch {}
+  }
+}
+
+// Apply the current voice.outputVol to every <audio> element rendering a
+// remote peer (active call + every mesh peer). Called when the slider
+// moves so changes take effect without a renegotiation.
+function applyOutputVolumeToActiveAudios() {
+  const vol = Math.min(1, (state.settings.voice.outputVol ?? 100) / 100);
   try {
-    const ctx = _getRnnoiseCtx();
-    if (ctx.state === 'suspended') await ctx.resume();
-    await _ensureRnnoiseAssets(ctx);
-
-    const src = ctx.createMediaStreamSource(rawStream);
-    // wasmBinary is structured-cloned into the worklet; copy each time so
-    // the worklet owns its own bytes.
-    const node = new AudioWorkletNode(ctx, RNNOISE_PROCESSOR_NAME, {
-      processorOptions: { maxChannels: 1, wasmBinary: _rnnoiseWasmBytes.slice(0) },
-    });
-    const dest = ctx.createMediaStreamDestination();
-    src.connect(node);
-    node.connect(dest);
-
-    klog.info('rnnoise', 'suppressor active', { simd: _rnnoiseWasmBytes.byteLength });
-    return {
-      stream: dest.stream,
-      dispose() {
-        try { src.disconnect(); } catch {}
-        try { node.disconnect(); } catch {}
-        try { node.port.postMessage('destroy'); } catch {}
-      },
-    };
-  } catch (e) {
-    klog.warn('rnnoise', 'suppressor unavailable, using raw mic', { err: e.message });
-    return { stream: rawStream, dispose: () => {} };
-  }
+    if (callMgr && callMgr.remoteAudio) callMgr.remoteAudio.volume = vol;
+  } catch {}
+  try {
+    if (state.mesh && state.mesh.peers) {
+      for (const [, entry] of state.mesh.peers) {
+        if (entry.remoteAudio) entry.remoteAudio.volume = vol;
+      }
+    }
+  } catch {}
 }
 
 // Restored from 0.1.16 (the last release where calls reliably reached
@@ -606,21 +708,27 @@ class CallManager {
 
   // ---- Speaking detection ----
   _startSpeakingDetection() {
-    if (this._speakCtx) return;
-    try { this._speakCtx = new (window.AudioContext || window.webkitAudioContext)(); }
-    catch { return; }
+    if (this._speakLoop) return;
     const tick = () => {
-      if (!this._speakCtx) return;
-      if (this.localStream && !this._selfAnalyser) {
-        try {
-          const src = this._speakCtx.createMediaStreamSource(this.localStream);
-          this._selfAnalyser = this._speakCtx.createAnalyser();
-          this._selfAnalyser.fftSize = 512;
-          src.connect(this._selfAnalyser);
-        } catch {}
+      // Self analyser comes from the mic pipeline (post-suppression) so
+      // keystrokes don't trigger the indicator. Falls back to spinning up
+      // a separate analyser only if the pipeline isn't there.
+      if (!this._selfAnalyser) {
+        if (this._micPipeline?.analyser) {
+          this._selfAnalyser = this._micPipeline.analyser;
+        } else if (this.localStream) {
+          try {
+            if (!this._speakCtx) this._speakCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const src = this._speakCtx.createMediaStreamSource(this.localStream);
+            this._selfAnalyser = this._speakCtx.createAnalyser();
+            this._selfAnalyser.fftSize = 512;
+            src.connect(this._selfAnalyser);
+          } catch {}
+        }
       }
       if (this.remoteAudio && this.remoteAudio.srcObject && !this._peerAnalyser) {
         try {
+          if (!this._speakCtx) this._speakCtx = new (window.AudioContext || window.webkitAudioContext)();
           const src = this._speakCtx.createMediaStreamSource(this.remoteAudio.srcObject);
           this._peerAnalyser = this._speakCtx.createAnalyser();
           this._peerAnalyser.fftSize = 512;
@@ -778,42 +886,19 @@ class CallManager {
       video: false,
     };
     this._micRaw = await navigator.mediaDevices.getUserMedia(constraints);
-    // RNNoise — drops impulsive non-speech (keyboards, mouse clicks, taps)
-    // that the browser's built-in suppression lets through. Runs before the
-    // amplitude gate so the gate is comparing against already-cleaned audio.
-    const _supp = await wrapStreamWithRnnoise(this._micRaw);
-    this._micSuppressed = _supp.stream;
-    this._micSuppressorDispose = _supp.dispose;
-    // Real-time noise gate (optional; reads settings.voice.noiseGate live).
-    if (state.settings.voice.noiseGate > 0) {
-      try {
-        this._micCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = this._micCtx.createMediaStreamSource(this._micSuppressed);
-        this._micGate = this._micCtx.createGain();
-        this._micGate.gain.value = 1;
-        const an = this._micCtx.createAnalyser();
-        an.fftSize = 512;
-        src.connect(an);
-        src.connect(this._micGate);
-        const dest = this._micCtx.createMediaStreamDestination();
-        this._micGate.connect(dest);
-        const buf = new Uint8Array(an.frequencyBinCount);
-        this._micGateLoop = setInterval(() => {
-          const threshold = state.settings.voice.noiseGate;
-          if (threshold <= 0) { this._micGate.gain.value = 1; return; }
-          an.getByteFrequencyData(buf);
-          let sum = 0; for (const x of buf) sum += x;
-          const avg = sum / buf.length;
-          const target = avg < threshold ? 0 : 1;
-          this._micGate.gain.setTargetAtTime(target, this._micCtx.currentTime, 0.025);
-        }, 50);
-        this.localStream = dest.stream;
-      } catch (e) {
-        klog.warn('call.gate', 'failed, using suppressed mic', { err: e.message });
-        this.localStream = this._micSuppressed;
-      }
-    } else {
-      this.localStream = this._micSuppressed;
+    // One pipeline owns the whole mic chain (RNNoise → input gain → noise
+    // gate → analyser → MediaStreamDestination) so settings sliders apply
+    // live and the speaking-detection analyser sees post-suppression
+    // audio (i.e. keystrokes don't light up the talking indicator).
+    this._micPipeline = new MicPipeline(this._micRaw);
+    try {
+      await this._micPipeline.build();
+      this.localStream = this._micPipeline.stream;
+    } catch (e) {
+      klog.warn('call.mic', 'pipeline failed, using raw mic', { err: e.message });
+      try { this._micPipeline?.destroy(); } catch {}
+      this._micPipeline = null;
+      this.localStream = this._micRaw;
     }
     if (state.globalMicMuted) {
       for (const t of this.localStream.getAudioTracks()) t.enabled = false;
@@ -911,14 +996,15 @@ class CallManager {
   }
 
   _teardown(reasonText) {
+    // Play a short descending tone whenever a connected call ends (any
+    // reason). For never-connected calls (e.g. cancelled before pickup)
+    // the dialing sound's stop is feedback enough; skip the tone.
+    if (this.state === 'connected') playDisconnectSound();
     this.state = 'ended';
     this._stopDialing();
     this._stopSpeakingDetection();
     if (this._iceTimeout) { clearTimeout(this._iceTimeout); this._iceTimeout = null; }
-    if (this._micGateLoop) { clearInterval(this._micGateLoop); this._micGateLoop = null; }
-    if (this._micCtx) { try { this._micCtx.close(); } catch {} this._micCtx = null; this._micGate = null; }
-    if (this._micSuppressorDispose) { try { this._micSuppressorDispose(); } catch {} this._micSuppressorDispose = null; }
-    this._micSuppressed = null;
+    if (this._micPipeline) { try { this._micPipeline.destroy(); } catch {} this._micPipeline = null; }
     if (this._micRaw && this._micRaw !== this.localStream) {
       for (const t of this._micRaw.getTracks()) try { t.stop(); } catch {}
     }
@@ -1006,9 +1092,16 @@ class MeshSession extends EventTarget {
       alert('Could not access microphone: ' + (e.message || e));
       return false;
     }
-    const _supp = await wrapStreamWithRnnoise(this._rawStream);
-    this.localStream = _supp.stream;
-    this._suppressorDispose = _supp.dispose;
+    this._micPipeline = new MicPipeline(this._rawStream);
+    try {
+      await this._micPipeline.build();
+      this.localStream = this._micPipeline.stream;
+    } catch (e) {
+      klog.warn('mesh.mic', 'pipeline failed, using raw mic', { err: e.message });
+      try { this._micPipeline?.destroy(); } catch {}
+      this._micPipeline = null;
+      this.localStream = this._rawStream;
+    }
     if (state.globalMicMuted) for (const t of this.localStream.getAudioTracks()) t.enabled = false;
 
     if (!state.realtime || !state.realtime.send({ type: 'room.join', roomId })) {
@@ -1152,12 +1245,16 @@ class MeshSession extends EventTarget {
   }
 
   _teardown() {
+    // Disconnect tone if we were actually in a room.
+    if (this.state === 'joining' || this.state === 'connected' || this.peers.size > 0) {
+      playDisconnectSound();
+    }
     for (const [, entry] of this.peers) {
       try { entry.pc.close(); } catch {}
       try { if (entry.remoteAudio) entry.remoteAudio.remove(); } catch {}
     }
     this.peers.clear();
-    if (this._suppressorDispose) { try { this._suppressorDispose(); } catch {} this._suppressorDispose = null; }
+    if (this._micPipeline) { try { this._micPipeline.destroy(); } catch {} this._micPipeline = null; }
     if (this._rawStream) {
       for (const t of this._rawStream.getTracks()) try { t.stop(); } catch {}
       this._rawStream = null;
@@ -1211,7 +1308,17 @@ function showActiveCallBar(peer, stateText) {
   // Paint the peer tile (data-ptile-peer) + the self tile (data-ptile-self).
   const peerTile = bar.querySelector('[data-ptile-peer]');
   const selfTile = bar.querySelector('[data-ptile-self]');
-  if (peerTile) paintAvatar(peerTile.querySelector('.avatar'), peer);
+  if (peerTile) {
+    paintAvatar(peerTile.querySelector('.avatar'), peer);
+    if (!peerTile.dataset.ctxWired) {
+      peerTile.dataset.ctxWired = '1';
+      peerTile.addEventListener('contextmenu', (e) => {
+        if (!callMgr.peer) return;
+        e.preventDefault();
+        openCallPeerContextMenu(e.clientX, e.clientY, callMgr.peer);
+      });
+    }
+  }
   if (selfTile && state.user) paintAvatar(selfTile.querySelector('.avatar'), state.user);
   const peerNameEl = bar.querySelector('[data-call-peer-name]');
   if (peerNameEl) peerNameEl.textContent = peer.displayName || peer.username || '—';
@@ -1366,6 +1473,7 @@ function showLocalScreenShareIndicator() {
   if (callMgr.screenStream) localVid.srcObject = callMgr.screenStream;
   tilesWrap.hidden = false;
   localTile.classList.remove('hidden');
+  wireScreenTileFullscreen(localTile, localVid);
   syncStageMode();
 }
 function hideLocalScreenShareIndicator() {
@@ -1391,15 +1499,67 @@ function showRemoteScreenShare(stream, peer) {
   if (lbl) lbl.textContent = (peer && (peer.displayName || peer.username)) || 'Peer screen';
   tilesWrap.hidden = false;
   tile.classList.remove('hidden');
-  // Click to fullscreen the remote stream.
-  if (!vid.dataset.fsWired) {
-    vid.dataset.fsWired = '1';
-    vid.addEventListener('dblclick', () => {
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else vid.requestFullscreen().catch(() => {});
-    });
-  }
+  wireScreenTileFullscreen(tile, vid);
   syncStageMode();
+}
+
+// Right-click on a peer's tile in the active-call banner. Currently
+// surfaces a per-call volume slider that scales the remote audio element
+// directly — settings.voice.outputVol still controls the master, this
+// just lets the user quiet a single loud peer mid-call.
+function openCallPeerContextMenu(x, y, peer) {
+  const audio = callMgr && callMgr.remoteAudio;
+  const masterVol = (state.settings.voice.outputVol ?? 100) / 100;
+  // The audio element's .volume is 0..1. We render a 0..200% slider so the
+  // user can boost above the master setting (capped at 1.0 internally —
+  // beyond that would need a Web Audio gain node we don't have here).
+  const startPct = audio ? Math.round(audio.volume / Math.max(0.01, masterVol) * 100) : 100;
+  openContextMenu(x, y, [
+    { label: peer.displayName || peer.username || 'Peer', disabled: true },
+    { divider: true },
+    {
+      slider: {
+        label: 'User volume',
+        min: 0, max: 200, value: Math.min(200, Math.max(0, startPct)),
+        format: (v) => v + '%',
+        onInput: (v) => {
+          if (!callMgr || !callMgr.remoteAudio) return;
+          const target = Math.min(1, masterVol * (v / 100));
+          callMgr.remoteAudio.volume = target;
+        },
+      },
+    },
+    { divider: true },
+    {
+      label: 'View profile',
+      icon: 'klar-user',
+      onClick: () => openProfileModal(peer),
+    },
+  ]);
+}
+
+// Fullscreen affordance for a screen-share tile: hover-revealed corner
+// button + double-click + 'F' keyboard shortcut while the tile is the
+// active hover target. Idempotent — second invocation on the same tile
+// skips re-wiring.
+function wireScreenTileFullscreen(tile, vid) {
+  if (tile.dataset.fsWired === '1') return;
+  tile.dataset.fsWired = '1';
+  const btn = tile.querySelector('[data-screen-fs]');
+  const enterIcon = btn?.querySelector('[data-fs-enter]');
+  const exitIcon  = btn?.querySelector('[data-fs-exit]');
+  const toggle = (e) => {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else vid.requestFullscreen().catch((err) => klog.warn('screen.fs', 'requestFullscreen failed', { err: err.message }));
+  };
+  if (btn) btn.addEventListener('click', toggle);
+  vid.addEventListener('dblclick', toggle);
+  document.addEventListener('fullscreenchange', () => {
+    const inFs = document.fullscreenElement === vid;
+    if (enterIcon) enterIcon.hidden = inFs;
+    if (exitIcon)  exitIcon.hidden  = !inFs;
+  });
 }
 function hideRemoteScreenShare() {
   const bar = _callBanner();
@@ -1720,6 +1880,35 @@ function playNotifySound() {
   } catch {
     a.currentTime = 0; a.play().catch(() => {});
   }
+}
+
+// Synthesised "call ended" tone — two descending notes, ~280 ms total.
+// Generated with Web Audio so we don't need to ship another mp3 and so
+// the same code runs with no audio asset. Volume tracks the notification
+// sound slider.
+function playDisconnectSound() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const vol = Math.max(0, Math.min(1, ((state.settings?.notifications?.soundVolume) || 80) / 100)) * 0.4;
+    const now = ctx.currentTime;
+    const beep = (freq, start, dur) => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, now + start);
+      g.gain.exponentialRampToValueAtTime(vol, now + start + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(g); g.connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.05);
+    };
+    beep(587.33, 0,     0.16); // D5
+    beep(440.00, 0.14,  0.22); // A4
+    setTimeout(() => { try { ctx.close(); } catch {} }, 600);
+  } catch {}
 }
 
 // Lazy permission request — only the first time a notification would fire.
@@ -4290,6 +4479,34 @@ function openContextMenu(x, y, items) {
       menu.appendChild(d);
       continue;
     }
+    if (it.slider) {
+      // Inline slider row: { slider: { label, min, max, value, format, onInput } }
+      const s = it.slider;
+      const wrap = document.createElement('div');
+      wrap.className = 'ctx-slider';
+      const lbl = document.createElement('div');
+      lbl.className = 'ctx-slider-label';
+      const text = document.createElement('span'); text.textContent = s.label || '';
+      const val  = document.createElement('span'); val.className = 'ctx-slider-value';
+      val.textContent = s.format ? s.format(s.value) : String(s.value);
+      lbl.appendChild(text); lbl.appendChild(val);
+      const input = document.createElement('input');
+      input.type = 'range';
+      input.min = String(s.min ?? 0);
+      input.max = String(s.max ?? 100);
+      input.value = String(s.value ?? 0);
+      input.addEventListener('input', (e) => {
+        const v = +input.value;
+        val.textContent = s.format ? s.format(v) : String(v);
+        try { s.onInput?.(v); } catch (err) { klog.error('ctx.slider', 'onInput failed', { err: err.message }); }
+      });
+      // Don't dismiss the menu while dragging the slider.
+      input.addEventListener('mousedown', (e) => e.stopPropagation());
+      input.addEventListener('keydown',   (e) => e.stopPropagation());
+      wrap.appendChild(lbl); wrap.appendChild(input);
+      menu.appendChild(wrap);
+      continue;
+    }
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'ctx-item' + (it.danger ? ' danger' : '');
@@ -4407,10 +4624,21 @@ function openSettingsModal() {
       saveSettings();
     });
 
-    inputVol.addEventListener('input', () => { settings.voice.inputVol  = +inputVol.value;  inputVolV.textContent  = inputVol.value  + '%'; saveSettings(); });
+    inputVol.addEventListener('input', () => {
+      // The MicPipeline's interval reads inputVol live, so changing this
+      // setting takes effect within ~50ms in active calls and the test
+      // loopback. No teardown needed.
+      settings.voice.inputVol  = +inputVol.value;
+      inputVolV.textContent    = inputVol.value + '%';
+      saveSettings();
+    });
     outputVol.addEventListener('input', () => {
-      settings.voice.outputVol = +outputVol.value; outputVolV.textContent = outputVol.value + '%'; saveSettings();
-      if (callMgr.remoteAudio) callMgr.remoteAudio.volume = Math.min(1, settings.voice.outputVol / 100);
+      settings.voice.outputVol = +outputVol.value;
+      outputVolV.textContent   = outputVol.value + '%';
+      saveSettings();
+      applyOutputVolumeToActiveAudios();
+      // Mic-test loopback isn't tracked by the global helper.
+      if (testLoopAudio) testLoopAudio.volume = Math.min(1, settings.voice.outputVol / 100);
     });
     if (rnnoise) rnnoise.addEventListener('change', () => { settings.voice.rnnoise = rnnoise.checked; saveSettings(); });
     noiseSup.addEventListener('change',   () => { settings.voice.noiseSuppression = noiseSup.checked;   saveSettings(); });
@@ -4456,27 +4684,24 @@ function openSettingsModal() {
       obs.observe(document.body, { childList: true, subtree: true });
     }
 
-    // Mic test with loopback. The loopback piggybacks on the same
-    // analyser so we only get ONE getUserMedia stream — the audio is
-    // both metered AND piped to a hidden <audio> element so the user
-    // hears themselves.
-    let testCtx = null, testStream = null, testRawStream = null, testSuppressorDispose = null, testRaf = 0, testLoopAudio = null, testGateGain = null;
+    // Mic test with loopback. Uses the same MicPipeline as live calls so
+    // the test reflects exactly what peers will hear: RNNoise suppression,
+    // input volume, and the noise gate all run inside the pipeline. The
+    // analyser node from the pipeline drives the meter.
+    let testPipeline = null, testRawStream = null, testRaf = 0, testLoopAudio = null;
     const testBtn      = modal.querySelector('[data-mic-test-btn]');
     const loopbackChk  = modal.querySelector('[data-mic-loopback]');
     const meter        = modal.querySelector('[data-mic-meter]');
     const meterFill    = meter.querySelector('span');
     const stopTest = () => {
-      if (testSuppressorDispose) { try { testSuppressorDispose(); } catch {} testSuppressorDispose = null; }
-      if (testRawStream) for (const t of testRawStream.getTracks()) try { t.stop(); } catch {}
-      if (testStream && testStream !== testRawStream) for (const t of testStream.getTracks()) try { t.stop(); } catch {}
-      if (testCtx) try { testCtx.close(); } catch {}
-      if (testLoopAudio) { try { testLoopAudio.pause(); testLoopAudio.srcObject = null; testLoopAudio.remove(); } catch {} }
-      testStream = null; testRawStream = null; testCtx = null; testLoopAudio = null; testGateGain = null;
+      if (testPipeline) { try { testPipeline.destroy(); } catch {} testPipeline = null; }
+      if (testRawStream) { for (const t of testRawStream.getTracks()) try { t.stop(); } catch {}; testRawStream = null; }
+      if (testLoopAudio) { try { testLoopAudio.pause(); testLoopAudio.srcObject = null; testLoopAudio.remove(); } catch {} testLoopAudio = null; }
       cancelAnimationFrame(testRaf); meterFill.style.width = '0%';
       testBtn.textContent = 'Start test';
     };
     testBtn.addEventListener('click', async () => {
-      if (testStream) { stopTest(); return; }
+      if (testPipeline) { stopTest(); return; }
       try {
         testRawStream = await navigator.mediaDevices.getUserMedia({
           audio: {
@@ -4487,44 +4712,33 @@ function openSettingsModal() {
           },
           video: false,
         });
-        const _supp = await wrapStreamWithRnnoise(testRawStream);
-        testStream = _supp.stream;
-        testSuppressorDispose = _supp.dispose;
-        testCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const src = testCtx.createMediaStreamSource(testStream);
-        const an = testCtx.createAnalyser(); an.fftSize = 512;
-        // Apply the noise gate live so the meter + loopback reflect it.
-        testGateGain = testCtx.createGain();
-        testGateGain.gain.value = 1;
-        src.connect(an);
-        src.connect(testGateGain);
+        testPipeline = new MicPipeline(testRawStream);
+        await testPipeline.build();
         if (loopbackChk && loopbackChk.checked) {
-          // Pipe processed audio out so the user hears themselves. We use
-          // a MediaStreamDestination + <audio> rather than connecting to
-          // ctx.destination because Audio elements honor setSinkId for
-          // routing to a chosen output device.
-          const dest = testCtx.createMediaStreamDestination();
-          testGateGain.connect(dest);
+          // Audio element rather than ctx.destination so we honour
+          // setSinkId for output-device routing.
           testLoopAudio = document.createElement('audio');
           testLoopAudio.autoplay = true;
-          testLoopAudio.srcObject = dest.stream;
+          testLoopAudio.srcObject = testPipeline.stream;
+          testLoopAudio.volume = Math.min(1, (settings.voice.outputVol ?? 100) / 100);
           if (settings.voice.outputDeviceId && testLoopAudio.setSinkId) {
             testLoopAudio.setSinkId(settings.voice.outputDeviceId).catch(() => {});
           }
           document.body.appendChild(testLoopAudio);
         }
+        const an = testPipeline.analyser;
         const buf = new Uint8Array(an.frequencyBinCount);
         const tick = () => {
           an.getByteFrequencyData(buf);
           let sum = 0; for (const v of buf) sum += v;
           const avg = sum / buf.length;
-          // Apply the gate: silence below threshold derived from slider.
-          const gateThreshold = settings.voice.noiseGate; // 0–100
-          if (testGateGain) testGateGain.gain.value = (gateThreshold > 0 && avg < gateThreshold) ? 0 : 1;
-          const pct = Math.min(100, Math.round((avg / 100) * settings.voice.inputVol));
+          const gateThreshold = settings.voice.noiseGate || 0;
+          // Meter shows post-suppression, post-gain, post-gate level. Gate
+          // mutes loopback already; this just visualises the gate state.
+          const gated = gateThreshold > 0 && avg < gateThreshold;
+          const pct = gated ? 0 : Math.min(100, Math.round(avg));
           meterFill.style.width = pct + '%';
-          // Visual feedback: change meter colour when gate is closing
-          meter.classList.toggle('gated', gateThreshold > 0 && avg < gateThreshold);
+          meter.classList.toggle('gated', gated);
           testRaf = requestAnimationFrame(tick);
         };
         tick();
@@ -4532,7 +4746,7 @@ function openSettingsModal() {
       } catch (e) {
         meterFill.style.width = '0%';
         klog.warn('settings.mictest', 'failed', { err: e.message });
-        testBtn.textContent = 'Start test';
+        stopTest();
       }
     });
 
