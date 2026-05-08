@@ -1,19 +1,19 @@
 {
-  "version": "0.1.34",
-  "releasedAt": "2026-05-08T21:44:20.671Z",
+  "version": "0.1.35",
+  "releasedAt": "2026-05-08T21:57:34.064Z",
   "serverUrl": "https://thatsalotofbees.online",
   "files": [
     {
       "path": "api.js",
-      "sha256": "182a6640175fcc5af4327a523e551be2233e2df3f83ff08d0d3b78c5acd2f5e6"
+      "sha256": "eab67fee8b5a7308ccad8c941c53eb31aa09a31616d82dad528f9684c399732d"
     },
     {
       "path": "app.js",
-      "sha256": "6281269e173d191129bb7a65ac4c78027e557619dec6183e2bb120fc6a7443d4"
+      "sha256": "73288a1dd56ee9b52aad74345ac4c0c5f57cda81bc6265057eb15f3c88c8a023"
     },
     {
       "path": "index.html",
-      "sha256": "c4e51117f7f26b1b2962203ec3b3f53ef570b9967c09796baefe5fd99735c142"
+      "sha256": "dd9a942dc20c2eaf8b0a1f0ddc784eaf8dfa5e7c590622733e162bb1a5309601"
     },
     {
       "path": "sounds/dialing.mp3",
@@ -25,7 +25,7 @@
     },
     {
       "path": "styles.css",
-      "sha256": "544bd023e03dd6dc588818c9ee28411433b56b41fe90c8bf66c26e4026b33959"
+      "sha256": "d126b38437ecf3426ddfaeb0fc753359592b62835e975f7385d1d5f85adac089"
     },
     {
       "path": "vendor/rnnoise/rnnoise.wasm",
@@ -40,5 +40,5 @@
       "sha256": "7e95f138ff6901a6a246dd29e6be4a1e8e4ada2baf0bcc04dae065745b51ff3d"
     }
   ],
-  "notes": "0.1.34: Voice fixes + screen-share fullscreen button + per-peer volume + disconnect tone. RNNoise pipeline now actually runs (post-suppression analyser drives the talking indicator, sliders update live in calls). Right-click a peer's call tile to adjust their volume. Fullscreen button on screen-share tiles. Disconnect chime when a call ends."
+  "notes": "0.1.35: Custom MP3 player (kap) replaces the bare browser audio control on mp3/wav/ogg/m4a/opus/flac links and attachments. Friend system: send/accept/decline requests; DMs are gated until mutual — server returns 403 not_friends and the renderer shows an inline banner with a one-click 'Send friend request' button. Existing DM pairs auto-friended on first boot."
 }

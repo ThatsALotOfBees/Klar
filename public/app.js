@@ -118,6 +118,11 @@ const state = {
   groupHistoryFetched: new Set(),
   activeGroupChatId: null,
 
+  // Friendships. friends is the raw list; friendsByUserId is a fast-lookup
+  // index by the OTHER user's id (i.e. what you have with that person).
+  friends: [],
+  friendsByUserId: new Map(),
+
   // Voice channel presence: channelId -> Set<userId>. Updated by
   // voice_channel_member-joined / -left WS events.
   voiceChannelMembers: new Map(),
@@ -2221,6 +2226,10 @@ function enterApp() {
   state.realtime.addEventListener('group_chat_message', (e) => onRemoteGroupChatMessage(e.detail.message));
   state.realtime.addEventListener('group_chat_message_deleted', (e) => onRemoteGroupChatMessageDeleted(e.detail));
 
+  // Friendship events
+  state.realtime.addEventListener('friend_updated', (e) => onRemoteFriendUpdated(e.detail.friend));
+  state.realtime.addEventListener('friend_removed', (e) => onRemoteFriendRemoved(e.detail));
+
   state.realtime.connect();
 
   // Render the home view IMMEDIATELY with whatever's cached (usually empty
@@ -2232,6 +2241,7 @@ function enterApp() {
   loadDms().catch((e) => klog.error('enterApp.loadDms', 'failed', { err: e.message }));
   loadGroupChats().catch((e) => klog.error('enterApp.loadGroupChats', 'failed', { err: e.message }));
   loadServers().catch((e) => klog.error('enterApp.loadServers', 'failed', { err: e.message }));
+  loadFriends().catch((e) => klog.error('enterApp.loadFriends', 'failed', { err: e.message }));
 
   // Re-discover the server URL every minute so friends auto-track tunnel
   // URL changes mid-session without a manual restart.
@@ -2260,6 +2270,199 @@ async function loadGroupChats() {
   } catch (e) {
     klog.warn('groups.load', 'failed', { err: e.message });
   }
+}
+
+// ---- Friendships ---------------------------------------------------------
+
+async function loadFriends() {
+  const { friends } = await api.listFriends();
+  state.friends = Array.isArray(friends) ? friends : [];
+  state.friendsByUserId = new Map();
+  for (const f of state.friends) {
+    if (f.user) {
+      state.friendsByUserId.set(f.user.id, f);
+      rememberUser(f.user);
+    }
+  }
+  syncFriendsBadge();
+}
+
+function onRemoteFriendUpdated(friend) {
+  if (!friend || !friend.user) return;
+  rememberUser(friend.user);
+  const i = state.friends.findIndex((f) => f.user && f.user.id === friend.user.id);
+  if (i >= 0) state.friends[i] = friend; else state.friends.unshift(friend);
+  state.friendsByUserId.set(friend.user.id, friend);
+  syncFriendsBadge();
+  // Toast on incoming pending request, or on someone accepting our request.
+  if (friend.status === 'pending' && friend.direction === 'incoming') {
+    playNotifySound();
+  } else if (friend.status === 'mutual' && friend.acceptedAt && Date.now() - friend.acceptedAt < 5000) {
+    playNotifySound();
+  }
+  // Re-render the friends modal if it's open.
+  const modal = document.querySelector('[data-friends-modal]');
+  if (modal) renderFriendsModalBody(modal);
+}
+
+function onRemoteFriendRemoved(payload) {
+  const userId = payload && payload.userId;
+  if (!userId) return;
+  state.friends = state.friends.filter((f) => !(f.user && f.user.id === userId));
+  state.friendsByUserId.delete(userId);
+  syncFriendsBadge();
+  const modal = document.querySelector('[data-friends-modal]');
+  if (modal) renderFriendsModalBody(modal);
+}
+
+function pendingIncomingFriendCount() {
+  let n = 0;
+  for (const f of state.friends) if (f.status === 'pending' && f.direction === 'incoming') n++;
+  return n;
+}
+
+function syncFriendsBadge() {
+  const btn = document.querySelector('[data-friends-btn]');
+  if (!btn) return;
+  const n = pendingIncomingFriendCount();
+  let badge = btn.querySelector('.friends-badge');
+  if (n > 0) {
+    if (!badge) { badge = document.createElement('span'); badge.className = 'friends-badge'; btn.appendChild(badge); }
+    badge.textContent = String(n);
+  } else if (badge) {
+    badge.remove();
+  }
+}
+
+function openFriendsModal() {
+  const existing = document.querySelector('[data-friends-modal]');
+  if (existing) { existing.remove(); return; }
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.dataset.friendsModal = '1';
+  modal.innerHTML = `
+    <div class="modal friends-modal">
+      <header>
+        <h2>Friends</h2>
+        <button class="ghost" data-close type="button" aria-label="Close">×</button>
+      </header>
+      <div class="friends-add">
+        <input type="text" data-friends-add-input placeholder="username" autocomplete="off" />
+        <button type="button" data-friends-add-btn>Add</button>
+        <p class="muted small" data-friends-add-status></p>
+      </div>
+      <div class="friends-body" data-friends-body></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+  modal.querySelector('[data-close]').addEventListener('click', () => modal.remove());
+  const input = modal.querySelector('[data-friends-add-input]');
+  const status = modal.querySelector('[data-friends-add-status]');
+  const submit = async () => {
+    const username = input.value.trim();
+    if (!username) return;
+    status.textContent = 'Sending…'; status.classList.remove('error');
+    try {
+      const r = await api.requestFriend(username);
+      input.value = '';
+      const f = r.friend;
+      if (f && f.status === 'mutual') status.textContent = `You and @${f.user.username} are now friends.`;
+      else if (f && f.status === 'pending' && f.direction === 'outgoing') status.textContent = `Request sent to @${f.user.username}.`;
+      else status.textContent = '';
+      await loadFriends();
+      renderFriendsModalBody(modal);
+    } catch (e) {
+      status.textContent = e.message || 'Failed';
+      status.classList.add('error');
+    }
+  };
+  modal.querySelector('[data-friends-add-btn]').addEventListener('click', submit);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  renderFriendsModalBody(modal);
+  setTimeout(() => input.focus(), 30);
+}
+
+function renderFriendsModalBody(modal) {
+  const body = modal.querySelector('[data-friends-body]');
+  if (!body) return;
+  body.innerHTML = '';
+  const incoming = state.friends.filter((f) => f.status === 'pending' && f.direction === 'incoming');
+  const outgoing = state.friends.filter((f) => f.status === 'pending' && f.direction === 'outgoing');
+  const mutual   = state.friends.filter((f) => f.status === 'mutual');
+
+  function section(title, list, emptyText) {
+    const sec = document.createElement('div');
+    sec.className = 'friends-section';
+    sec.innerHTML = `<h3>${title} <span class="friends-count">${list.length}</span></h3><ul class="friends-list"></ul>`;
+    const ul = sec.querySelector('ul');
+    if (list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'muted small'; li.textContent = emptyText;
+      ul.appendChild(li);
+    }
+    for (const f of list) {
+      const li = document.createElement('li');
+      li.className = 'friends-row';
+      const av = document.createElement('div'); av.className = 'avatar';
+      paintAvatar(av, f.user);
+      const nameWrap = document.createElement('div'); nameWrap.className = 'friends-name';
+      nameWrap.innerHTML = `<div class="friends-display"></div><div class="friends-handle"></div>`;
+      nameWrap.querySelector('.friends-display').textContent = f.user.displayName || f.user.username;
+      nameWrap.querySelector('.friends-handle').textContent = '@' + f.user.username;
+      const actions = document.createElement('div'); actions.className = 'friends-actions';
+      if (f.status === 'pending' && f.direction === 'incoming') {
+        const accept = document.createElement('button'); accept.textContent = 'Accept'; accept.className = 'primary';
+        const decline = document.createElement('button'); decline.textContent = 'Decline'; decline.className = 'ghost';
+        accept.addEventListener('click', async () => {
+          accept.disabled = decline.disabled = true;
+          try { await api.acceptFriend(f.user.id); await loadFriends(); renderFriendsModalBody(modal); }
+          catch (e) { alert(e.message); accept.disabled = decline.disabled = false; }
+        });
+        decline.addEventListener('click', async () => {
+          accept.disabled = decline.disabled = true;
+          try { await api.removeFriend(f.user.id); await loadFriends(); renderFriendsModalBody(modal); }
+          catch (e) { alert(e.message); accept.disabled = decline.disabled = false; }
+        });
+        actions.append(accept, decline);
+      } else if (f.status === 'pending' && f.direction === 'outgoing') {
+        const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.className = 'ghost';
+        cancel.addEventListener('click', async () => {
+          cancel.disabled = true;
+          try { await api.removeFriend(f.user.id); await loadFriends(); renderFriendsModalBody(modal); }
+          catch (e) { alert(e.message); cancel.disabled = false; }
+        });
+        actions.appendChild(cancel);
+      } else if (f.status === 'mutual') {
+        const msg = document.createElement('button'); msg.textContent = 'Message'; msg.className = 'ghost';
+        const remove = document.createElement('button'); remove.textContent = 'Remove'; remove.className = 'ghost danger';
+        msg.addEventListener('click', async () => {
+          try {
+            const r = await api.createDm(f.user.id);
+            const dm = r.dm;
+            if (!state.dms.find((d) => d.id === dm.id)) state.dms.unshift(dm);
+            renderDmList();
+            modal.remove();
+            switchView({ kind: 'home' });
+            setTimeout(() => openDm(dm.id), 30);
+          } catch (e) { alert(e.message); }
+        });
+        remove.addEventListener('click', async () => {
+          if (!confirm(`Remove @${f.user.username} from friends?`)) return;
+          remove.disabled = msg.disabled = true;
+          try { await api.removeFriend(f.user.id); await loadFriends(); renderFriendsModalBody(modal); }
+          catch (e) { alert(e.message); remove.disabled = msg.disabled = false; }
+        });
+        actions.append(msg, remove);
+      }
+      li.append(av, nameWrap, actions);
+      ul.appendChild(li);
+    }
+    body.appendChild(sec);
+  }
+  section('Incoming requests', incoming, 'No pending requests.');
+  section('Friends', mutual, 'You have no friends yet.');
+  section('Outgoing requests', outgoing, 'No requests sent.');
 }
 
 // Group-chat WS handlers ----------------------------------------------------
@@ -2479,6 +2682,9 @@ function renderHomeSidebar() {
   renderMeBar();
   const newGroupBtn = root.querySelector('[data-action="new-group-chat"]');
   if (newGroupBtn) newGroupBtn.addEventListener('click', openCreateGroupChatModal);
+  const friendsBtn = root.querySelector('[data-friends-btn]');
+  if (friendsBtn) friendsBtn.addEventListener('click', openFriendsModal);
+  syncFriendsBadge();
 
   const emptyTitle = root.querySelector('[data-chat-empty] h2');
   const emptyP = root.querySelector('[data-chat-empty] p');
@@ -3051,6 +3257,16 @@ function setComposerStatus(text, encrypted) {
 
 function renderDmMessages(dm) {
   const list = root.querySelector('[data-messages]');
+  // Drop any stale not-friends banner from a previous chat. We re-add it
+  // below if this DM is also gated.
+  const oldBanner = list.parentElement?.querySelector('[data-not-friends-banner]');
+  if (oldBanner) oldBanner.remove();
+  // Pre-empt the gate: if we're not friends with this DM's peer, show the
+  // banner immediately so the user knows why their messages will fail
+  // before they hit Enter.
+  const fr = state.friendsByUserId?.get(dm.other.id);
+  if (!fr || fr.status !== 'mutual') showNotFriendsBanner(dm);
+
   clear(list);
   list.appendChild(buildChannelIntro({ kind: 'dm', name: dm.other.displayName, username: dm.other.username }));
   const messages = state.messagesByDm.get(dm.id) || [];
@@ -3482,11 +3698,7 @@ function buildEmbed(url, type, attachmentMeta) {
       card.querySelector('.rvl-spinner').remove();
     });
   } else if (type === 'audio') {
-    const a = document.createElement('audio');
-    a.src = abs;
-    a.controls = true;
-    a.preload = 'metadata';
-    wrap.appendChild(a);
+    wrap.appendChild(buildCustomAudioPlayer(abs, attachmentMeta));
   } else {
     // Generic file chip
     const a = document.createElement('a');
@@ -3640,6 +3852,147 @@ function buildCustomVideoPlayer(src) {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     else wrap.requestFullscreen().catch(() => {});
   });
+
+  setVolUI();
+  setProgressUI();
+  setPlayUI();
+  return wrap;
+}
+
+// Custom audio player for mp3/wav/ogg/m4a/opus/flac attachments + URLs.
+// Browser default <audio controls> looks alien against the cosmic theme;
+// this matches the video-player styling. Compact horizontal layout: play
+// button, scrub bar with elapsed/total, volume. Volume persists across
+// player instances (shared with the video player setting).
+function buildCustomAudioPlayer(src, attachmentMeta) {
+  const wrap = document.createElement('div');
+  wrap.className = 'kap';
+  const filename = (attachmentMeta && attachmentMeta.name) || (() => {
+    try { return decodeURIComponent(new URL(src, location.href).pathname.split('/').pop() || 'audio'); }
+    catch { return 'audio'; }
+  })();
+  wrap.innerHTML = `
+    <audio data-kap-audio preload="metadata"></audio>
+    <button class="kap-play" data-kap-play type="button" aria-label="Play / pause">
+      <svg viewBox="0 0 24 24" width="16" height="16" data-kap-play-icon><path d="M7 5l13 7-13 7z" fill="currentColor"/></svg>
+    </button>
+    <div class="kap-body">
+      <div class="kap-name" data-kap-name></div>
+      <div class="kap-row">
+        <span class="kap-time" data-kap-time>0:00 / 0:00</span>
+        <div class="kap-scrub" data-kap-scrub>
+          <div class="kap-scrub-buf"   data-kap-buf></div>
+          <div class="kap-scrub-fill"  data-kap-fill></div>
+          <div class="kap-scrub-thumb" data-kap-thumb></div>
+        </div>
+      </div>
+    </div>
+    <button class="kap-btn" data-kap-volbtn type="button" aria-label="Mute / unmute">
+      <svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 9v6h4l6 5V4L8 9H4z" fill="currentColor"/></svg>
+    </button>
+    <div class="kap-vol" data-kap-vol>
+      <div class="kap-vol-fill"  data-kap-volfill></div>
+      <div class="kap-vol-thumb" data-kap-volthumb></div>
+    </div>
+    <a class="kap-dl" data-kap-dl title="Download" aria-label="Download">
+      <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </a>
+  `;
+  const audio  = wrap.querySelector('[data-kap-audio]');
+  const playBtn= wrap.querySelector('[data-kap-play]');
+  const playIc = wrap.querySelector('[data-kap-play-icon]');
+  const nameEl = wrap.querySelector('[data-kap-name]');
+  const timeEl = wrap.querySelector('[data-kap-time]');
+  const scrub  = wrap.querySelector('[data-kap-scrub]');
+  const fill   = wrap.querySelector('[data-kap-fill]');
+  const thumb  = wrap.querySelector('[data-kap-thumb]');
+  const buf    = wrap.querySelector('[data-kap-buf]');
+  const volBtn = wrap.querySelector('[data-kap-volbtn]');
+  const vol    = wrap.querySelector('[data-kap-vol]');
+  const volFill= wrap.querySelector('[data-kap-volfill]');
+  const volThumb=wrap.querySelector('[data-kap-volthumb]');
+  const dl     = wrap.querySelector('[data-kap-dl]');
+
+  audio.src = src;
+  nameEl.textContent = filename;
+  dl.href = src;
+  dl.download = filename;
+
+  // Share volume preference with the video player.
+  const savedVol = parseFloat(localStorage.getItem('klar.kvp.vol'));
+  audio.volume = (Number.isFinite(savedVol) && savedVol >= 0 && savedVol <= 1) ? savedVol : 0.8;
+
+  const fmt = (s) => {
+    if (!Number.isFinite(s)) return '0:00';
+    s = Math.max(0, Math.floor(s));
+    const m = Math.floor(s / 60), ss = String(s % 60).padStart(2, '0');
+    if (m >= 60) { const h = Math.floor(m / 60), mm = String(m % 60).padStart(2, '0'); return `${h}:${mm}:${ss}`; }
+    return `${m}:${ss}`;
+  };
+  const setVolUI = () => {
+    const v = audio.muted ? 0 : audio.volume;
+    volFill.style.width  = (v * 100) + '%';
+    volThumb.style.left  = (v * 100) + '%';
+  };
+  const setProgressUI = () => {
+    const d = audio.duration || 0;
+    const p = d > 0 ? (audio.currentTime / d) : 0;
+    fill.style.width = (p * 100) + '%';
+    thumb.style.left = (p * 100) + '%';
+    if (audio.buffered && audio.buffered.length) {
+      const end = audio.buffered.end(audio.buffered.length - 1);
+      buf.style.width = (Math.min(1, end / Math.max(1, d)) * 100) + '%';
+    }
+    timeEl.textContent = fmt(audio.currentTime) + ' / ' + fmt(d);
+  };
+  const setPlayUI = () => {
+    if (audio.paused) {
+      playIc.innerHTML = '<path d="M7 5l13 7-13 7z" fill="currentColor"/>';
+      wrap.classList.remove('playing');
+    } else {
+      playIc.innerHTML = '<path d="M6 4h4v16H6zM14 4h4v16h-4z" fill="currentColor"/>';
+      wrap.classList.add('playing');
+    }
+  };
+  const togglePlay = () => { if (audio.paused) audio.play().catch(() => {}); else audio.pause(); };
+
+  audio.addEventListener('loadedmetadata', setProgressUI);
+  audio.addEventListener('timeupdate',     setProgressUI);
+  audio.addEventListener('progress',       setProgressUI);
+  audio.addEventListener('volumechange',   () => { setVolUI(); localStorage.setItem('klar.kvp.vol', audio.volume); });
+  audio.addEventListener('play',  setPlayUI);
+  audio.addEventListener('pause', setPlayUI);
+  audio.addEventListener('error', () => {
+    wrap.classList.add('failed');
+    nameEl.textContent = filename + ' — failed to load';
+  });
+
+  playBtn.addEventListener('click', togglePlay);
+
+  let scrubbing = false;
+  const seekFromEvent = (e) => {
+    const r = scrub.getBoundingClientRect();
+    const x = Math.max(0, Math.min(r.width, (e.clientX || (e.touches && e.touches[0].clientX) || 0) - r.left));
+    const p = r.width > 0 ? x / r.width : 0;
+    if (Number.isFinite(audio.duration)) audio.currentTime = audio.duration * p;
+  };
+  scrub.addEventListener('mousedown', (e) => { scrubbing = true; seekFromEvent(e); });
+  document.addEventListener('mousemove', (e) => { if (scrubbing) seekFromEvent(e); });
+  document.addEventListener('mouseup',   () => { scrubbing = false; });
+
+  // Volume drag, identical pattern to video player.
+  let volDrag = false;
+  const volFromEvent = (e) => {
+    const r = vol.getBoundingClientRect();
+    const x = Math.max(0, Math.min(r.width, (e.clientX || (e.touches && e.touches[0].clientX) || 0) - r.left));
+    const v = r.width > 0 ? x / r.width : 0;
+    audio.muted = false;
+    audio.volume = v;
+  };
+  vol.addEventListener('mousedown', (e) => { volDrag = true; volFromEvent(e); });
+  document.addEventListener('mousemove', (e) => { if (volDrag) volFromEvent(e); });
+  document.addEventListener('mouseup',   () => { volDrag = false; });
+  volBtn.addEventListener('click', () => { audio.muted = !audio.muted; });
 
   setVolUI();
   setProgressUI();
@@ -4121,7 +4474,54 @@ async function sendDmMessage(text, attachments) {
   } catch (err) {
     klog.error('msg.dm.send', 'failed', { dm: dm.id, clientId, err: err.message });
     markMessageFailed(clientId, err.message);
+    if (err.code === 'not_friends') {
+      showNotFriendsBanner(dm);
+    }
   }
+}
+
+// Banner shown above the message list when a DM send is rejected because
+// the two users aren't friends. Includes a one-click "Send friend request"
+// affordance so the user doesn't have to hunt for it.
+function showNotFriendsBanner(dm) {
+  const list = root.querySelector('[data-messages]');
+  if (!list) return;
+  let banner = list.querySelector('[data-not-friends-banner]');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.className = 'not-friends-banner';
+    banner.dataset.notFriendsBanner = '1';
+    list.parentElement.insertBefore(banner, list);
+  }
+  const fr = state.friendsByUserId?.get(dm.other.id);
+  let msg = `You can't message @${dm.other.username} until you're friends.`;
+  let btn = 'Send friend request';
+  let action = 'request';
+  if (fr) {
+    if (fr.status === 'pending' && fr.direction === 'outgoing') {
+      msg = `Friend request to @${dm.other.username} is pending.`;
+      btn = 'Cancel request'; action = 'remove';
+    } else if (fr.status === 'pending' && fr.direction === 'incoming') {
+      msg = `@${dm.other.username} sent you a friend request.`;
+      btn = 'Accept'; action = 'accept';
+    }
+  }
+  banner.innerHTML = `<span></span><button type="button" data-fr-action></button>`;
+  banner.querySelector('span').textContent = msg;
+  const actionBtn = banner.querySelector('[data-fr-action]');
+  actionBtn.textContent = btn;
+  actionBtn.addEventListener('click', async () => {
+    actionBtn.disabled = true;
+    try {
+      if (action === 'request') await api.requestFriend(dm.other.username);
+      else if (action === 'accept') await api.acceptFriend(dm.other.id);
+      else if (action === 'remove') await api.removeFriend(dm.other.id);
+      banner.remove();
+    } catch (e) {
+      actionBtn.disabled = false;
+      alert(e.message || 'Failed');
+    }
+  });
 }
 
 async function sendGroupChatMessage(text, attachments) {

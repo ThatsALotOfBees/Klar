@@ -189,6 +189,25 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks(blocked_id);
 
+-- Friendships gate every DM message: status must be 'accepted' before
+-- either side can send. Stored with sorted (user_a < user_b) so each
+-- pair has exactly one row regardless of who initiated. requester_id
+-- records who sent the original request so the recipient can accept.
+CREATE TABLE IF NOT EXISTS friendships (
+  user_a TEXT NOT NULL,
+  user_b TEXT NOT NULL,
+  status TEXT NOT NULL,            -- 'pending' | 'accepted'
+  requester_id TEXT NOT NULL,      -- whoever called POST /api/friends/request
+  created_at INTEGER NOT NULL,
+  accepted_at INTEGER,
+  PRIMARY KEY (user_a, user_b),
+  FOREIGN KEY (user_a) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_b) REFERENCES users(id) ON DELETE CASCADE,
+  CHECK (user_a < user_b)
+);
+CREATE INDEX IF NOT EXISTS idx_friendships_a ON friendships(user_a);
+CREATE INDEX IF NOT EXISTS idx_friendships_b ON friendships(user_b);
+
 -- Group DMs (separate from 1:1 dms so existing logic stays untouched).
 -- members are tracked in group_chat_members. Group messages live in the
 -- existing messages table via the new group_chat_id column.
@@ -527,6 +546,54 @@ function isBlocked(aId, bId) {
 function blockedByMe(meId, otherId) {
   return !!db.prepare('SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?').get(meId, otherId);
 }
+
+// ---- Friendships --------------------------------------------------------
+//
+// Pairs are stored sorted (user_a < user_b) so a single row covers both
+// directions. requester_id records who sent the original request — the
+// other party is the only one who can accept it. status is 'pending' or
+// 'accepted'. Removing a friend (or declining a request) just deletes
+// the row so a fresh request later starts clean.
+function _sortedPair(a, b) { return a < b ? [a, b] : [b, a]; }
+function getFriendship(aId, bId) {
+  const [a, b] = _sortedPair(aId, bId);
+  return db.prepare('SELECT * FROM friendships WHERE user_a = ? AND user_b = ?').get(a, b);
+}
+function areFriends(aId, bId) {
+  const f = getFriendship(aId, bId);
+  return !!(f && f.status === 'accepted');
+}
+function friendshipRow(f, meId) {
+  if (!f) return null;
+  const otherId = f.user_a === meId ? f.user_b : f.user_a;
+  const other = db.prepare('SELECT * FROM users WHERE id = ?').get(otherId);
+  return {
+    user: other ? publicUser(other) : null,
+    status: f.status,
+    direction: f.status === 'pending' ? (f.requester_id === meId ? 'outgoing' : 'incoming') : 'mutual',
+    createdAt: f.created_at,
+    acceptedAt: f.accepted_at || null,
+  };
+}
+
+// One-shot migration: every existing 1:1 DM gets an auto-accepted
+// friendship so older conversations don't go silent the moment the
+// gate ships. INSERT OR IGNORE lets us run on every boot safely.
+(() => {
+  const dms = db.prepare('SELECT user_a, user_b, created_at FROM dms').all();
+  const ins = db.prepare(`
+    INSERT OR IGNORE INTO friendships
+      (user_a, user_b, status, requester_id, created_at, accepted_at)
+    VALUES (?, ?, 'accepted', ?, ?, ?)
+  `);
+  let backfilled = 0;
+  for (const d of dms) {
+    const [a, b] = _sortedPair(d.user_a, d.user_b);
+    const r = ins.run(a, b, a, d.created_at, d.created_at);
+    if (r.changes) backfilled++;
+  }
+  if (backfilled) log.info('friendships.migrate', `auto-friended ${backfilled} existing DM pairs`);
+})();
 function channelMessageRow(m) {
   return {
     id: m.id,
@@ -685,8 +752,8 @@ function send(res, status, body, headers = {}) {
   });
   res.end(data);
 }
-function sendError(res, status, message) {
-  send(res, status, { error: message });
+function sendError(res, status, message, extra) {
+  send(res, status, { error: message, ...(extra || {}) });
 }
 
 async function readJson(req) {
@@ -1102,6 +1169,87 @@ route('GET', /^\/api\/users\/search/, async (req, res) => {
   send(res, 200, { users: rows.map(publicUser) });
 });
 
+// ---- Friendships --------------------------------------------------------
+
+route('GET', /^\/api\/friends$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const rows = db.prepare(`SELECT * FROM friendships WHERE user_a = ? OR user_b = ? ORDER BY created_at DESC`).all(me.id, me.id);
+  send(res, 200, { friends: rows.map((f) => friendshipRow(f, me.id)).filter(Boolean) });
+});
+
+// Send a friend request by username. Body: { username }.
+// 200 → { friend } with status 'pending' if new, or whatever the row already is.
+route('POST', /^\/api\/friends\/request$/, async (req, res) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const body = await readJson(req);
+  const username = String((body.username || '')).trim().toLowerCase();
+  if (!username) return sendError(res, 400, 'username required');
+  const other = db.prepare('SELECT * FROM users WHERE LOWER(username) = ?').get(username);
+  if (!other) return sendError(res, 404, 'user not found');
+  if (other.id === me.id) return sendError(res, 400, 'cannot friend yourself');
+  if (isBlocked(me.id, other.id)) return sendError(res, 403, 'cannot friend a blocked user');
+
+  const existing = getFriendship(me.id, other.id);
+  if (existing) {
+    // If the other side already requested us, treat this as an accept so
+    // the request → counter-request flow Just Works.
+    if (existing.status === 'pending' && existing.requester_id === other.id) {
+      const [a, b] = _sortedPair(me.id, other.id);
+      db.prepare('UPDATE friendships SET status = "accepted", accepted_at = ? WHERE user_a = ? AND user_b = ?')
+        .run(Date.now(), a, b);
+      const updated = getFriendship(me.id, other.id);
+      log.info('friend.accept', 'auto-accepted via reverse-request', { me: me.username, other: other.username });
+      broadcastToUser(me.id,   { type: 'friend_updated', friend: friendshipRow(updated, me.id) });
+      broadcastToUser(other.id,{ type: 'friend_updated', friend: friendshipRow(updated, other.id) });
+      return send(res, 200, { friend: friendshipRow(updated, me.id) });
+    }
+    return send(res, 200, { friend: friendshipRow(existing, me.id) });
+  }
+  const [a, b] = _sortedPair(me.id, other.id);
+  const now = Date.now();
+  db.prepare(`INSERT INTO friendships (user_a, user_b, status, requester_id, created_at) VALUES (?,?,?,?,?)`)
+    .run(a, b, 'pending', me.id, now);
+  const created = getFriendship(me.id, other.id);
+  log.info('friend.request', 'created', { from: me.username, to: other.username });
+  broadcastToUser(me.id,    { type: 'friend_updated', friend: friendshipRow(created, me.id) });
+  broadcastToUser(other.id, { type: 'friend_updated', friend: friendshipRow(created, other.id) });
+  send(res, 200, { friend: friendshipRow(created, me.id) });
+});
+
+// Accept a pending request from userId.
+route('POST', /^\/api\/friends\/([a-f0-9]+)\/accept$/, async (req, res, [, userId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const f = getFriendship(me.id, userId);
+  if (!f || f.status !== 'pending') return sendError(res, 404, 'no pending request from that user');
+  if (f.requester_id === me.id)     return sendError(res, 400, 'only the recipient can accept');
+  const [a, b] = _sortedPair(me.id, userId);
+  db.prepare('UPDATE friendships SET status = "accepted", accepted_at = ? WHERE user_a = ? AND user_b = ?')
+    .run(Date.now(), a, b);
+  const updated = getFriendship(me.id, userId);
+  log.info('friend.accept', 'accepted', { me: me.username, other: userId.slice(0, 8) });
+  broadcastToUser(me.id,   { type: 'friend_updated', friend: friendshipRow(updated, me.id) });
+  broadcastToUser(userId,  { type: 'friend_updated', friend: friendshipRow(updated, userId) });
+  send(res, 200, { friend: friendshipRow(updated, me.id) });
+});
+
+// Decline a pending request OR remove an existing friend OR cancel an
+// outgoing request — all collapse to "delete the row".
+route('DELETE', /^\/api\/friends\/([a-f0-9]+)$/, async (req, res, [, userId]) => {
+  const me = authedUser(req);
+  if (!me) return sendError(res, 401, 'not authenticated');
+  const f = getFriendship(me.id, userId);
+  if (!f) return send(res, 200, { ok: true });
+  const [a, b] = _sortedPair(me.id, userId);
+  db.prepare('DELETE FROM friendships WHERE user_a = ? AND user_b = ?').run(a, b);
+  log.info('friend.remove', 'removed', { me: me.username, other: userId.slice(0, 8), wasStatus: f.status });
+  broadcastToUser(me.id,  { type: 'friend_removed', userId });
+  broadcastToUser(userId, { type: 'friend_removed', userId: me.id });
+  send(res, 200, { ok: true });
+});
+
 route('GET', /^\/api\/dms$/, async (req, res) => {
   const me = authedUser(req);
   if (!me) return sendError(res, 401, 'not authenticated');
@@ -1182,6 +1330,19 @@ route('POST', /^\/api\/dms\/([a-f0-9]+)\/messages$/, async (req, res, [, dmId]) 
   // Refuse if either side has blocked the other.
   const otherId = otherUserId(me, dm);
   if (isBlocked(me.id, otherId)) return sendError(res, 403, 'cannot send: user is blocked');
+  // Friendship gate: both sides must have accepted before chat is allowed.
+  // 403 + code:'not_friends' so the renderer can show a tailored message
+  // instead of the generic error.
+  if (!areFriends(me.id, otherId)) {
+    const f = getFriendship(me.id, otherId);
+    let detail = 'send a friend request first';
+    if (f && f.status === 'pending') {
+      detail = f.requester_id === me.id
+        ? 'waiting for them to accept your friend request'
+        : 'they sent you a friend request — accept it first';
+    }
+    return sendError(res, 403, 'not friends — ' + detail, { code: 'not_friends' });
+  }
   const body = await readJson(req);
   const content = body.content || '';
   // E2EE was removed in 0.1.8; we ignore any encrypted/nonce fields a stale
