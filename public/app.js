@@ -120,8 +120,11 @@ const state = {
 
   // Friendships. friends is the raw list; friendsByUserId is a fast-lookup
   // index by the OTHER user's id (i.e. what you have with that person).
+  // friendsLoaded flips on the first successful loadFriends() so we don't
+  // briefly mis-flag every active DM as "not friends" during boot.
   friends: [],
   friendsByUserId: new Map(),
+  friendsLoaded: false,
 
   // Voice channel presence: channelId -> Set<userId>. Updated by
   // voice_channel_member-joined / -left WS events.
@@ -374,14 +377,17 @@ class MicPipeline {
     if (this.ctx.state === 'suspended') {
       try { await this.ctx.resume(); } catch {}
     }
-    if (wantRnnoise) {
-      try {
-        await _ensureRnnoiseAssets(this.ctx);
-        this.usingRnnoise = true;
-      } catch (e) {
-        klog.warn('mic.rnnoise', 'asset load failed, suppressor off', { err: e.message });
-      }
+    // Try to load RNNoise assets even if currently disabled — this lets a
+    // mid-call toggle from off→on engage the suppressor without doing
+    // an async wasm fetch under the user's finger.
+    let assetsReady = false;
+    try {
+      await _ensureRnnoiseAssets(this.ctx);
+      assetsReady = true;
+    } catch (e) {
+      klog.warn('mic.rnnoise', 'asset load failed, suppressor unavailable', { err: e.message });
     }
+    this._rnnoiseAvailable = assetsReady;
 
     this.src = this.ctx.createMediaStreamSource(this.rawStream);
     this.inputGain = this.ctx.createGain();
@@ -391,34 +397,28 @@ class MicPipeline {
     this._buf = new Uint8Array(this.analyser.frequencyBinCount);
     this.destination = this.ctx.createMediaStreamDestination();
 
-    let upstream = this.src;
-    if (this.usingRnnoise) {
+    if (assetsReady) {
       try {
-        // wasmBinary is structured-cloned to the worklet; pass a copy.
         this.suppressor = new AudioWorkletNode(this.ctx, RNNOISE_PROCESSOR_NAME, {
           processorOptions: { maxChannels: 1, wasmBinary: _rnnoiseWasmBytes.slice(0) },
         });
-        this.src.connect(this.suppressor);
-        upstream = this.suppressor;
-        klog.info('mic.rnnoise', 'suppressor instantiated');
       } catch (e) {
         klog.warn('mic.rnnoise', 'worklet instantiate failed', { err: e.message });
-        this.usingRnnoise = false;
+        this.suppressor = null;
+        this._rnnoiseAvailable = false;
       }
     }
-
-    upstream.connect(this.inputGain);
-    this.inputGain.connect(this.gateGain);
-    this.gateGain.connect(this.analyser);
-    this.analyser.connect(this.destination);
+    this.usingRnnoise = !!(wantRnnoise && this.suppressor);
+    this._rebuildChain();
 
     // Initial gain values — read live state.
     this.inputGain.gain.value = (state.settings.voice.inputVol ?? 100) / 100;
     this.gateGain.gain.value = 1;
 
-    // Settings tick: input volume + noise gate read live so sliders take
-    // effect mid-call without a teardown/rebuild. setTargetAtTime gives a
-    // short ramp so the gate doesn't click open/closed.
+    // Settings tick: input volume, noise gate, and RNNoise toggle read
+    // live so sliders/checkboxes take effect mid-call without a
+    // teardown/rebuild. setTargetAtTime gives a short ramp so the gate
+    // doesn't click open/closed.
     this._loop = setInterval(() => {
       if (this._destroyed) return;
       const inputVol = (state.settings.voice.inputVol ?? 100) / 100;
@@ -434,10 +434,39 @@ class MicPipeline {
         const target = avg < threshold ? 0 : 1;
         this.gateGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.025);
       }
+
+      // RNNoise live toggle: reconnect the chain to bypass or re-engage
+      // the suppressor when the setting changes mid-call.
+      const wantRnnoise = !!state.settings.voice.rnnoise && !!this.suppressor;
+      if (wantRnnoise !== this.usingRnnoise) {
+        this.usingRnnoise = wantRnnoise;
+        try { this._rebuildChain(); klog.info('mic.rnnoise', wantRnnoise ? 'engaged live' : 'bypassed live'); }
+        catch (e) { klog.warn('mic.rnnoise', 'live toggle failed', { err: e.message }); }
+      }
     }, 50);
 
     _activeMicPipelines.add(this);
     return this;
+  }
+
+  // (Re)wire the audio graph based on this.usingRnnoise. Disconnects
+  // every node from its predecessors first so a toggle doesn't leave
+  // stale connections (which would silently double-mix audio).
+  _rebuildChain() {
+    try { this.src.disconnect(); } catch {}
+    if (this.suppressor) { try { this.suppressor.disconnect(); } catch {} }
+    try { this.inputGain.disconnect(); } catch {}
+    try { this.gateGain.disconnect(); } catch {}
+    try { this.analyser.disconnect(); } catch {}
+    if (this.usingRnnoise && this.suppressor) {
+      this.src.connect(this.suppressor);
+      this.suppressor.connect(this.inputGain);
+    } else {
+      this.src.connect(this.inputGain);
+    }
+    this.inputGain.connect(this.gateGain);
+    this.gateGain.connect(this.analyser);
+    this.analyser.connect(this.destination);
   }
 
   get stream() { return this.destination?.stream; }
@@ -1515,9 +1544,9 @@ function showRemoteScreenShare(stream, peer) {
 function openCallPeerContextMenu(x, y, peer) {
   const audio = callMgr && callMgr.remoteAudio;
   const masterVol = (state.settings.voice.outputVol ?? 100) / 100;
-  // The audio element's .volume is 0..1. We render a 0..200% slider so the
-  // user can boost above the master setting (capped at 1.0 internally —
-  // beyond that would need a Web Audio gain node we don't have here).
+  // 0–100% relative to the master output volume. HTMLAudioElement.volume
+  // is hard-capped at 1.0 by the spec, so a 0–200% slider would have a
+  // dead top half — clamp the UI to match what audio can actually do.
   const startPct = audio ? Math.round(audio.volume / Math.max(0.01, masterVol) * 100) : 100;
   openContextMenu(x, y, [
     { label: peer.displayName || peer.username || 'Peer', disabled: true },
@@ -1525,12 +1554,11 @@ function openCallPeerContextMenu(x, y, peer) {
     {
       slider: {
         label: 'User volume',
-        min: 0, max: 200, value: Math.min(200, Math.max(0, startPct)),
+        min: 0, max: 100, value: Math.min(100, Math.max(0, startPct)),
         format: (v) => v + '%',
         onInput: (v) => {
           if (!callMgr || !callMgr.remoteAudio) return;
-          const target = Math.min(1, masterVol * (v / 100));
-          callMgr.remoteAudio.volume = target;
+          callMgr.remoteAudio.volume = Math.min(1, masterVol * (v / 100));
         },
       },
     },
@@ -2284,7 +2312,18 @@ async function loadFriends() {
       rememberUser(f.user);
     }
   }
+  state.friendsLoaded = true;
   syncFriendsBadge();
+  // If a DM is already open, the banner was suppressed during the load
+  // race — reconcile now that we know the actual friendship state.
+  if (state.activeDmId) {
+    const dm = state.dms.find((d) => d.id === state.activeDmId);
+    if (dm) {
+      const f = state.friendsByUserId.get(dm.other.id);
+      if (!f || f.status !== 'mutual') showNotFriendsBanner(dm);
+      else clearNotFriendsBanner();
+    }
+  }
 }
 
 function onRemoteFriendUpdated(friend) {
@@ -2300,6 +2339,17 @@ function onRemoteFriendUpdated(friend) {
   } else if (friend.status === 'mutual' && friend.acceptedAt && Date.now() - friend.acceptedAt < 5000) {
     playNotifySound();
   }
+  // If this friend update is about the currently-open DM, drop the
+  // not-friends banner the moment we become mutual; otherwise re-render
+  // it so the action button reflects the new state (e.g. an outgoing
+  // request that just got accepted should show "Send message" instead).
+  if (state.activeDmId) {
+    const dm = state.dms.find((d) => d.id === state.activeDmId);
+    if (dm && dm.other.id === friend.user.id) {
+      if (friend.status === 'mutual') clearNotFriendsBanner();
+      else showNotFriendsBanner(dm);
+    }
+  }
   // Re-render the friends modal if it's open.
   const modal = document.querySelector('[data-friends-modal]');
   if (modal) renderFriendsModalBody(modal);
@@ -2311,6 +2361,12 @@ function onRemoteFriendRemoved(payload) {
   state.friends = state.friends.filter((f) => !(f.user && f.user.id === userId));
   state.friendsByUserId.delete(userId);
   syncFriendsBadge();
+  // If the active DM is with this user, the gate just closed — show the
+  // banner so they can request again (or block).
+  if (state.activeDmId) {
+    const dm = state.dms.find((d) => d.id === state.activeDmId);
+    if (dm && dm.other.id === userId) showNotFriendsBanner(dm);
+  }
   const modal = document.querySelector('[data-friends-modal]');
   if (modal) renderFriendsModalBody(modal);
 }
@@ -2323,15 +2379,17 @@ function pendingIncomingFriendCount() {
 
 function syncFriendsBadge() {
   const btn = document.querySelector('[data-friends-btn]');
-  if (!btn) return;
-  const n = pendingIncomingFriendCount();
-  let badge = btn.querySelector('.friends-badge');
-  if (n > 0) {
-    if (!badge) { badge = document.createElement('span'); badge.className = 'friends-badge'; btn.appendChild(badge); }
-    badge.textContent = String(n);
-  } else if (badge) {
-    badge.remove();
+  if (btn) {
+    const n = pendingIncomingFriendCount();
+    let badge = btn.querySelector('.friends-badge');
+    if (n > 0) {
+      if (!badge) { badge = document.createElement('span'); badge.className = 'friends-badge'; btn.appendChild(badge); }
+      badge.textContent = String(n);
+    } else if (badge) {
+      badge.remove();
+    }
   }
+  syncHomeRailFriendDot();
 }
 
 function openFriendsModal() {
@@ -2347,22 +2405,40 @@ function openFriendsModal() {
         <button class="ghost" data-close type="button" aria-label="Close">×</button>
       </header>
       <div class="friends-add">
-        <input type="text" data-friends-add-input placeholder="username" autocomplete="off" />
-        <button type="button" data-friends-add-btn>Add</button>
+        <div class="friends-add-row">
+          <input type="text" data-friends-add-input placeholder="username" autocomplete="off" />
+          <button type="button" data-friends-add-btn>Add</button>
+        </div>
+        <div class="friends-add-suggestions" data-friends-suggestions hidden></div>
         <p class="muted small" data-friends-add-status></p>
       </div>
       <div class="friends-body" data-friends-body></div>
     </div>
   `;
   document.body.appendChild(modal);
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
-  modal.querySelector('[data-close]').addEventListener('click', () => modal.remove());
-  const input = modal.querySelector('[data-friends-add-input]');
+  const close = () => {
+    document.removeEventListener('keydown', onKey);
+    modal.remove();
+  };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  document.addEventListener('keydown', onKey);
+  modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  modal.querySelector('[data-close]').addEventListener('click', close);
+
+  const input  = modal.querySelector('[data-friends-add-input]');
   const status = modal.querySelector('[data-friends-add-status]');
-  const submit = async () => {
-    const username = input.value.trim();
+  const sugBox = modal.querySelector('[data-friends-suggestions]');
+
+  // Normalise the typed username — server matches LOWER(username) so a
+  // leading "@" or stray whitespace is the user's intent, not their name.
+  const cleanUsername = (raw) => raw.replace(/^@+/, '').trim();
+
+  const submit = async (overrideName) => {
+    const username = cleanUsername(overrideName ?? input.value);
     if (!username) return;
-    status.textContent = 'Sending…'; status.classList.remove('error');
+    status.classList.remove('error');
+    status.textContent = 'Sending…';
+    sugBox.hidden = true;
     try {
       const r = await api.requestFriend(username);
       input.value = '';
@@ -2377,7 +2453,48 @@ function openFriendsModal() {
       status.classList.add('error');
     }
   };
-  modal.querySelector('[data-friends-add-btn]').addEventListener('click', submit);
+
+  // Search-as-you-type. Debounced 200ms — same UX as the home sidebar
+  // user search. Suggestions are clickable and bypass typing the full
+  // username.
+  let searchTimer = 0;
+  let searchSeq = 0;
+  input.addEventListener('input', () => {
+    status.textContent = '';
+    status.classList.remove('error');
+    clearTimeout(searchTimer);
+    const q = cleanUsername(input.value);
+    if (q.length < 2) { sugBox.hidden = true; sugBox.innerHTML = ''; return; }
+    const seq = ++searchSeq;
+    searchTimer = setTimeout(async () => {
+      try {
+        const { users } = await api.searchUsers(q);
+        if (seq !== searchSeq) return;
+        sugBox.innerHTML = '';
+        const filtered = users.filter((u) => {
+          const f = state.friendsByUserId.get(u.id);
+          return !f || f.status !== 'mutual'; // skip people you're already friends with
+        });
+        if (filtered.length === 0) { sugBox.hidden = true; return; }
+        for (const u of filtered.slice(0, 6)) {
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'friends-suggestion';
+          row.innerHTML = `<div class="avatar"></div><div class="friends-suggestion-name"><div class="friends-display"></div><div class="friends-handle"></div></div>`;
+          paintAvatar(row.querySelector('.avatar'), u);
+          row.querySelector('.friends-display').textContent = u.displayName || u.username;
+          row.querySelector('.friends-handle').textContent  = '@' + u.username;
+          row.addEventListener('click', () => submit(u.username));
+          sugBox.appendChild(row);
+        }
+        sugBox.hidden = false;
+      } catch {
+        sugBox.hidden = true;
+      }
+    }, 200);
+  });
+
+  modal.querySelector('[data-friends-add-btn]').addEventListener('click', () => submit());
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
   renderFriendsModalBody(modal);
   setTimeout(() => input.focus(), 30);
@@ -2638,6 +2755,26 @@ function renderServerRail() {
   // Update home-slot active state
   const homeSlot = root.querySelector('[data-action="select-home"]');
   if (homeSlot) homeSlot.classList.toggle('active', state.view.kind === 'home');
+  syncHomeRailFriendDot();
+}
+
+// Show a small dot on the home rail icon when there are pending incoming
+// friend requests, so the user gets a cue even when they're deep in a
+// server channel.
+function syncHomeRailFriendDot() {
+  const homeSlot = root.querySelector('[data-action="select-home"]');
+  if (!homeSlot) return;
+  const n = pendingIncomingFriendCount();
+  let dot = homeSlot.querySelector('.rail-friend-dot');
+  if (n > 0) {
+    if (!dot) {
+      dot = document.createElement('span');
+      dot.className = 'rail-friend-dot';
+      homeSlot.appendChild(dot);
+    }
+  } else if (dot) {
+    dot.remove();
+  }
 }
 
 // ===========================================================================
@@ -2655,6 +2792,7 @@ async function switchView(view) {
   clear(root.querySelector('[data-messages]'));
   clear(root.querySelector('[data-chat-header]'));
   setComposerStatus(null, false);
+  clearNotFriendsBanner();
 
   // Hide members panel by default; server view re-shows it.
   root.querySelector('[data-app-shell]').classList.add('no-members');
@@ -3298,6 +3436,7 @@ function openGroupChat(chatId) {
   state.activeDmId = null;
   state.activeChannelId = null;
   state.activeGroupChatId = chatId;
+  clearNotFriendsBanner();
   renderDmList();
 
   const chat = state.groupChats.find((g) => g.id === chatId);
@@ -3864,12 +4003,22 @@ function buildCustomVideoPlayer(src) {
 // this matches the video-player styling. Compact horizontal layout: play
 // button, scrub bar with elapsed/total, volume. Volume persists across
 // player instances (shared with the video player setting).
+//
+// Active-player tracking: pressing play on any kap pauses every other
+// kap on the page. Two clips at once is almost never what the user
+// wants and is hard to recover from.
+const _activeKapPlayers = new Set();
 function buildCustomAudioPlayer(src, attachmentMeta) {
   const wrap = document.createElement('div');
   wrap.className = 'kap';
+  // Friendly filename: strip the path, then any query/hash that catbox
+  // and similar hosts tack on ("?download=1", "#t=10").
   const filename = (attachmentMeta && attachmentMeta.name) || (() => {
-    try { return decodeURIComponent(new URL(src, location.href).pathname.split('/').pop() || 'audio'); }
-    catch { return 'audio'; }
+    try {
+      const u = new URL(src, location.href);
+      const last = u.pathname.split('/').filter(Boolean).pop() || 'audio';
+      return decodeURIComponent(last);
+    } catch { return 'audio'; }
   })();
   wrap.innerHTML = `
     <audio data-kap-audio preload="metadata"></audio>
@@ -3915,6 +4064,7 @@ function buildCustomAudioPlayer(src, attachmentMeta) {
 
   audio.src = src;
   nameEl.textContent = filename;
+  nameEl.title = src; // hover reveals the full URL when the name is truncated
   dl.href = src;
   dl.download = filename;
 
@@ -3960,8 +4110,14 @@ function buildCustomAudioPlayer(src, attachmentMeta) {
   audio.addEventListener('timeupdate',     setProgressUI);
   audio.addEventListener('progress',       setProgressUI);
   audio.addEventListener('volumechange',   () => { setVolUI(); localStorage.setItem('klar.kvp.vol', audio.volume); });
-  audio.addEventListener('play',  setPlayUI);
-  audio.addEventListener('pause', setPlayUI);
+  audio.addEventListener('play',  () => {
+    setPlayUI();
+    // Pause every other kap on the page so two clips can't talk at once.
+    for (const other of _activeKapPlayers) if (other !== audio) try { other.pause(); } catch {}
+    _activeKapPlayers.add(audio);
+  });
+  audio.addEventListener('pause', () => { setPlayUI(); _activeKapPlayers.delete(audio); });
+  audio.addEventListener('ended', () => _activeKapPlayers.delete(audio));
   audio.addEventListener('error', () => {
     wrap.classList.add('failed');
     nameEl.textContent = filename + ' — failed to load';
@@ -4153,6 +4309,7 @@ function openChannel(channelId) {
   state.activeChannelId = channelId;
   state.activeDmId = null;
   state.activeGroupChatId = null;
+  clearNotFriendsBanner();
   if (state.view.kind !== 'server') return;
   const detail = state.serverDetails.get(state.view.serverId);
   if (!detail) return;
@@ -4481,47 +4638,86 @@ async function sendDmMessage(text, attachments) {
 }
 
 // Banner shown above the message list when a DM send is rejected because
-// the two users aren't friends. Includes a one-click "Send friend request"
-// affordance so the user doesn't have to hunt for it.
+// the two users aren't friends. The action buttons match the current
+// friendship state: a primary action (request/accept/cancel) plus a
+// secondary "Block" so unwanted strangers don't need a profile dive.
+//
+// We skip rendering until friends have loaded at least once — otherwise
+// every freshly-opened DM lights up as "not friends" during the brief
+// window between enterApp() and loadFriends() resolving.
 function showNotFriendsBanner(dm) {
+  if (!state.friendsLoaded) return;
   const list = root.querySelector('[data-messages]');
   if (!list) return;
-  let banner = list.querySelector('[data-not-friends-banner]');
+  let banner = list.parentElement.querySelector('[data-not-friends-banner]');
   if (!banner) {
     banner = document.createElement('div');
     banner.className = 'not-friends-banner';
     banner.dataset.notFriendsBanner = '1';
     list.parentElement.insertBefore(banner, list);
   }
-  const fr = state.friendsByUserId?.get(dm.other.id);
+  banner.dataset.peerId = dm.other.id;
+
+  const fr = state.friendsByUserId.get(dm.other.id);
   let msg = `You can't message @${dm.other.username} until you're friends.`;
-  let btn = 'Send friend request';
-  let action = 'request';
+  let primaryLabel = 'Send friend request';
+  let primaryAction = 'request';
+  let primaryConfirm = null;
   if (fr) {
     if (fr.status === 'pending' && fr.direction === 'outgoing') {
       msg = `Friend request to @${dm.other.username} is pending.`;
-      btn = 'Cancel request'; action = 'remove';
+      primaryLabel = 'Cancel request'; primaryAction = 'remove';
+      primaryConfirm = `Cancel your friend request to @${dm.other.username}?`;
     } else if (fr.status === 'pending' && fr.direction === 'incoming') {
       msg = `@${dm.other.username} sent you a friend request.`;
-      btn = 'Accept'; action = 'accept';
+      primaryLabel = 'Accept'; primaryAction = 'accept';
     }
   }
-  banner.innerHTML = `<span></span><button type="button" data-fr-action></button>`;
+
+  banner.innerHTML = `
+    <span></span>
+    <div class="nfb-actions">
+      <button type="button" class="nfb-primary"></button>
+      <button type="button" class="nfb-block">Block</button>
+    </div>
+  `;
   banner.querySelector('span').textContent = msg;
-  const actionBtn = banner.querySelector('[data-fr-action]');
-  actionBtn.textContent = btn;
-  actionBtn.addEventListener('click', async () => {
-    actionBtn.disabled = true;
+  const primaryBtn = banner.querySelector('.nfb-primary');
+  const blockBtn   = banner.querySelector('.nfb-block');
+  primaryBtn.textContent = primaryLabel;
+
+  primaryBtn.addEventListener('click', async () => {
+    if (primaryConfirm && !confirm(primaryConfirm)) return;
+    primaryBtn.disabled = blockBtn.disabled = true;
     try {
-      if (action === 'request') await api.requestFriend(dm.other.username);
-      else if (action === 'accept') await api.acceptFriend(dm.other.id);
-      else if (action === 'remove') await api.removeFriend(dm.other.id);
-      banner.remove();
+      if (primaryAction === 'request') await api.requestFriend(dm.other.username);
+      else if (primaryAction === 'accept') await api.acceptFriend(dm.other.id);
+      else if (primaryAction === 'remove') await api.removeFriend(dm.other.id);
+      // The WS roundtrip will refresh state and re-render the banner if
+      // we're still gated; clear it now so the user sees immediate
+      // feedback even before the broadcast lands.
+      clearNotFriendsBanner();
     } catch (e) {
-      actionBtn.disabled = false;
+      primaryBtn.disabled = blockBtn.disabled = false;
       alert(e.message || 'Failed');
     }
   });
+  blockBtn.addEventListener('click', async () => {
+    if (!confirm(`Block @${dm.other.username}? You won't see their messages or requests.`)) return;
+    primaryBtn.disabled = blockBtn.disabled = true;
+    try {
+      await api.blockUser(dm.other.id);
+      clearNotFriendsBanner();
+    } catch (e) {
+      primaryBtn.disabled = blockBtn.disabled = false;
+      alert(e.message || 'Failed to block');
+    }
+  });
+}
+
+function clearNotFriendsBanner() {
+  const banner = document.querySelector('[data-not-friends-banner]');
+  if (banner) banner.remove();
 }
 
 async function sendGroupChatMessage(text, attachments) {
